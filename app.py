@@ -363,16 +363,32 @@ def create_supabase_tables():
 
 
 def _clean_for_supabase(df):
-    """Replace NaN/inf values with None so Supabase JSON serialization doesn't fail."""
+    """Replace NaN/inf with None and convert float IDs (1.0, 2.0) to int
+    so Supabase bigint columns don't reject them.
+    """
     import math
+
+    # Integer columns that Supabase expects as bigint
+    int_cols = {"id", "client_id", "appointment_id", "duration_minutes",
+                "smtp_port", "auth_enabled", "gcal_enabled", "completed"}
+
     df = df.where(pd.notnull(df), None)
     records = df.to_dict("records")
     cleaned = []
     for row in records:
-        cleaned.append({
-            k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
-            for k, v in row.items()
-        })
+        clean_row = {}
+        for k, v in row.items():
+            if v is None:
+                clean_row[k] = None
+            elif isinstance(v, float) and (math.isnan(v) or math.isinf(v)):
+                clean_row[k] = None
+            elif isinstance(v, float) and k in int_cols and v == int(v):
+                clean_row[k] = int(v)
+            elif isinstance(v, float) and v == int(v) and k.endswith("_id") or k == "id":
+                clean_row[k] = int(v)
+            else:
+                clean_row[k] = v
+        cleaned.append(clean_row)
     return cleaned
 
 
