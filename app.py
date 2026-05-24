@@ -12,7 +12,7 @@ from streamlit_calendar import calendar
 
 
 DB_NAME = os.environ.get("NOTARY_DB_PATH", "notary_assistant.db")
-APP_VERSION = "3.1.0"
+APP_VERSION = "3.2.0"
 _SAFE_EXPORT_TABLES = frozenset(
     ["clients", "appointments", "payments", "checklist", "attachments", "followups", "settings"]
 )
@@ -325,6 +325,14 @@ def create_tables():
                 appointment_id INTEGER, followup_date TEXT, followup_type TEXT,
                 outcome TEXT, notes TEXT, completed INTEGER DEFAULT 0,
                 FOREIGN KEY (appointment_id) REFERENCES appointments(id))""",
+            """CREATE TABLE IF NOT EXISTS expenses (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                expense_date TEXT,
+                category TEXT,
+                description TEXT,
+                amount REAL,
+                receipt_path TEXT,
+                notes TEXT)""",
             """CREATE TABLE IF NOT EXISTS templates (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 template_name TEXT NOT NULL,
@@ -559,7 +567,9 @@ def update_settings(settings):
 
 
 def send_email(to_email, subject, body_text, pdf_bytes=None, pdf_filename=None, settings=None):
-    """Send an email via SMTP. Returns (success, error_message)."""
+    """Send an email via SMTP. Returns (success, error_message).
+    Automatically uses SSL (SMTP_SSL) for port 465, TLS (STARTTLS) for all others.
+    """
     import smtplib
     from email.mime.multipart import MIMEMultipart
     from email.mime.text import MIMEText
@@ -574,6 +584,7 @@ def send_email(to_email, subject, body_text, pdf_bytes=None, pdf_filename=None, 
     user = settings.get("smtp_user", "")
     password = settings.get("smtp_password", "")
     from_name = settings.get("smtp_from_name") or settings.get("business_name", "Notary Assistant")
+    use_ssl = port == 465  # SSL for 465, STARTTLS for 587 and others
 
     if not host or not user or not password:
         return False, "SMTP not configured. Add SMTP settings in Settings / Business Profile."
@@ -592,11 +603,19 @@ def send_email(to_email, subject, body_text, pdf_bytes=None, pdf_filename=None, 
             part.add_header("Content-Disposition", f"attachment; filename={pdf_filename}")
             msg.attach(part)
 
-        with smtplib.SMTP(host, port) as server:
-            server.ehlo()
-            server.starttls()
-            server.login(user, password)
-            server.sendmail(user, to_email, msg.as_string())
+        if use_ssl:
+            # Port 465 — SSL from the start
+            with smtplib.SMTP_SSL(host, port) as server:
+                server.login(user, password)
+                server.sendmail(user, to_email, msg.as_string())
+        else:
+            # Port 587 (or other) — STARTTLS
+            with smtplib.SMTP(host, port) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(user, password)
+                server.sendmail(user, to_email, msg.as_string())
 
         return True, None
     except Exception as e:
@@ -1342,6 +1361,55 @@ This is an estimate only. Final pricing may change based on document type, trave
 
 
 
+
+EXPENSE_CATEGORIES = [
+    "Notary Supplies", "E&O Insurance", "Background Check",
+    "Printing / Paper", "Mileage / Gas", "Software / Subscriptions",
+    "Training / Education", "Marketing", "Equipment", "Professional Fees", "Other"
+]
+
+
+def add_expense(expense_date, category, description, amount, notes):
+    if using_supabase():
+        try:
+            sb().table("expenses").insert({
+                "expense_date": str(expense_date), "category": category,
+                "description": description, "amount": float(amount), "notes": notes
+            }).execute()
+            return
+        except Exception:
+            pass
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO expenses (expense_date, category, description, amount, notes) VALUES (?, ?, ?, ?, ?)",
+            (str(expense_date), category, description, float(amount), notes)
+        )
+        conn.commit()
+
+
+def get_expenses_dataframe():
+    if using_supabase():
+        try:
+            resp = sb().table("expenses").select("*").order("expense_date", desc=True).execute()
+            if resp.data:
+                return pd.DataFrame(resp.data)
+        except Exception:
+            pass
+    with db_conn() as conn:
+        return pd.read_sql_query("SELECT * FROM expenses ORDER BY expense_date DESC", conn)
+
+
+def delete_expense(expense_id):
+    if using_supabase():
+        try:
+            sb().table("expenses").delete().eq("id", expense_id).execute()
+            return
+        except Exception:
+            pass
+    with db_conn() as conn:
+        conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+        conn.commit()
+
 def save_template(template_name, signing_type, location, fee, mileage, duration_minutes, notes, client_notes, internal_notes):
     with db_conn() as conn:
         conn.execute(
@@ -1781,6 +1849,43 @@ def validate_appointment_inputs(client_name, client_email, duration_minutes, fee
     return errors
 
 
+
+def global_search(query):
+    """Search across clients, appointments, and payments. Returns dict of results."""
+    if not query or len(query.strip()) < 2:
+        return {}
+    q = query.strip().lower()
+    results = {}
+
+    # Search clients
+    clients = get_clients()
+    matched_clients = [
+        c for c in clients
+        if q in (c[1] or "").lower()
+        or q in (c[2] or "").lower()
+        or q in (c[3] or "").lower()
+        or q in (c[4] or "").lower()
+    ]
+    if matched_clients:
+        results["clients"] = matched_clients
+
+    # Search appointments
+    df = get_all_appointments_dataframe()
+    if not df.empty:
+        mask = (
+            df["client_name"].str.lower().str.contains(q, na=False) |
+            df["signing_type"].str.lower().str.contains(q, na=False) |
+            df["location"].str.lower().str.contains(q, na=False) |
+            df["status"].str.lower().str.contains(q, na=False) |
+            df["notes"].fillna("").str.lower().str.contains(q, na=False) |
+            df["appointment_date"].astype(str).str.contains(q, na=False)
+        )
+        matched_appts = df[mask]
+        if not matched_appts.empty:
+            results["appointments"] = matched_appts
+
+    return results
+
 def appointment_selector(df, label="Select Appointment"):
     if df.empty:
         return None, None
@@ -2141,6 +2246,7 @@ if settings.get("auth_enabled") in [1, "1", True] and settings.get("app_password
 MENU_OPTIONS = [
     "Dashboard",
     "Calendar View",
+    "Global Search",
     "Add Client",
     "View Clients",
     "Edit Client",
@@ -2168,11 +2274,11 @@ MENU_OPTIONS = [
 ]
 
 MENU_GROUPS = {
-    "📊 Overview": ["Dashboard", "Calendar View"],
+    "📊 Overview": ["Dashboard", "Calendar View", "Global Search"],
     "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History", "Client Portal", "Retention Report"],
     "📅 Appointments": ["Add Appointment", "View Appointments", "Edit Appointment", "Delete Appointment", "Job Checklist", "Appointment Templates", "Recurring Scheduler"],
-    "💰 Finance": ["Payment Tracking", "Invoice Status", "Invoice Generator", "Quote Generator", "Reports / Export", "Mileage / Tax Report"],
-    "📬 Tools": ["Follow-Up Tracker", "Email Templates", "Map / Route Tools", "Document Attachments", "Referral Analytics", "Signing Day Sheet"],
+    "💰 Finance": ["Payment Tracking", "Invoice Status", "Invoice Generator", "Quote Generator", "Reports / Export", "Mileage / Tax Report", "Expense Tracker"],
+    "📬 Tools": ["Follow-Up Tracker", "Email Templates", "Map / Route Tools", "Document Attachments", "Referral Analytics", "Signing Day Sheet", "Service Area Map"],
     "⚙️ Admin": ["Admin / System Health", "Cloud Database Setup", "Settings / Business Profile", "Backup / Restore"],
 }
 
@@ -2816,6 +2922,58 @@ if menu == "Dashboard":
             if st.button("🔄 Refresh Data"):
                 clear_all_caches()
                 st.rerun()
+
+
+elif menu == "Global Search":
+    st.header("🔍 Global Search")
+    st.caption("Search across all clients, appointments, notes, and locations.")
+
+    query = st.text_input("Search", placeholder="Client name, location, signing type, date...",
+                          label_visibility="collapsed")
+
+    if query:
+        with st.spinner("Searching..."):
+            results = global_search(query)
+
+        if not results:
+            st.info(f"No results found for **{query}**")
+        else:
+            total = sum(
+                len(v) if not hasattr(v, '__len__') else
+                len(v) if isinstance(v, list) else len(v)
+                for v in results.values()
+            )
+            st.success(f"Found results across {len(results)} category(ies)")
+
+            if "clients" in results:
+                st.subheader(f"👤 Clients ({len(results['clients'])})")
+                for c in results["clients"]:
+                    with st.expander(f"{c[1]} — {c[3] or 'No email'}"):
+                        st.write(f"📞 {c[2] or '—'}")
+                        st.write(f"📍 {c[4] or '—'}")
+                        if st.button("View History", key=f"gs_client_{c[0]}"):
+                            st.session_state.selected_menu = "Client History"
+                            st.session_state["history_client_id"] = c[0]
+                            st.rerun()
+
+            if "appointments" in results:
+                appts = results["appointments"]
+                st.subheader(f"📅 Appointments ({len(appts)})")
+                all_paid = get_all_payment_totals()
+                for _, row in appts.sort_values("appointment_date", ascending=False).iterrows():
+                    paid = all_paid.get(int(row["id"]), 0.0)
+                    balance = max(float(row.get("fee") or 0) - paid, 0)
+                    with st.expander(
+                        f"{row['appointment_date']} — {row['client_name']} — "
+                        f"{row['signing_type']} — {row['status']}"
+                    ):
+                        st.write(f"📍 {row.get('location') or '—'}")
+                        st.write(f"💵 Fee: ${float(row.get('fee') or 0):,.2f}  "
+                                f"Paid: ${paid:,.2f}  Balance: ${balance:,.2f}")
+                        if row.get("notes"):
+                            st.caption(f"Notes: {row['notes']}")
+    else:
+        st.caption("Start typing to search across your entire database.")
 
 
 elif menu == "Calendar View":
@@ -3853,6 +4011,71 @@ elif menu == "Invoice Status":
             mime="text/csv"
         )
 
+        # ── Invoice Aging Report ──────────────────────────────────────────
+        st.divider()
+        st.subheader("📊 Invoice Aging Report")
+        st.caption("Unpaid and overdue invoices grouped by how long they've been outstanding.")
+
+        unpaid_df = invoice_df[invoice_df["invoice_status"].isin(["Unpaid", "Overdue", "Partially Paid"])].copy()
+
+        if unpaid_df.empty:
+            st.success("🎉 No outstanding invoices!")
+        else:
+            today_ts = pd.Timestamp(date.today())
+            unpaid_df["payment_due_date"] = pd.to_datetime(unpaid_df["payment_due_date"], errors="coerce")
+            unpaid_df["days_overdue"] = (today_ts - unpaid_df["payment_due_date"]).dt.days.fillna(0).astype(int)
+
+            def age_bucket(days):
+                if days <= 0: return "Current"
+                elif days <= 30: return "1-30 days"
+                elif days <= 60: return "31-60 days"
+                elif days <= 90: return "61-90 days"
+                else: return "90+ days"
+
+            unpaid_df["age_bucket"] = unpaid_df["days_overdue"].apply(age_bucket)
+            bucket_order = ["Current", "1-30 days", "31-60 days", "61-90 days", "90+ days"]
+            age_colors = {"Current": "#22c55e", "1-30 days": "#f59e0b",
+                          "31-60 days": "#f97316", "61-90 days": "#ef4444", "90+ days": "#7f1d1d"}
+
+            aging_summary = unpaid_df.groupby("age_bucket").agg(
+                invoices=("id", "count"), balance=("balance_due", "sum")
+            ).reindex(bucket_order).dropna()
+
+            is_dark_ag = dark_mode
+            cb = "#1e293b" if is_dark_ag else "#f8fafc"
+            cborder = "#334155" if is_dark_ag else "#e2e8f0"
+            clabel = "#94a3b8" if is_dark_ag else "#64748b"
+
+            ag_cols = st.columns(min(len(aging_summary), 5))
+            for i, (bucket, ag_row) in enumerate(aging_summary.iterrows()):
+                color = age_colors.get(bucket, "#64748b")
+                with ag_cols[i % len(ag_cols)]:
+                    bal = float(ag_row["balance"])
+                    inv = int(ag_row["invoices"])
+                    st.markdown(
+                        f'<div style="background:{cb};border:1px solid {cborder};border-radius:10px;'
+                        f'padding:0.6rem;border-left:4px solid {color};">'
+                        f'<div style="font-size:0.72rem;color:{clabel};">{bucket}</div>'
+                        f'<div style="font-size:1.1rem;font-weight:700;color:{color};">'
+                        + "${:,.2f}".format(bal) +
+                        f'</div><div style="font-size:0.75rem;color:{clabel};">{inv} invoice(s)</div></div>',
+                        unsafe_allow_html=True
+                    )
+
+            aging_detail = unpaid_df[[
+                "client_name", "appointment_date", "payment_due_date",
+                "days_overdue", "age_bucket", "balance_due", "invoice_status"
+            ]].sort_values("days_overdue", ascending=False).copy()
+            aging_detail.columns = ["Client","Appt Date","Due Date","Days Overdue","Age","Balance","Status"]
+            aging_detail["Balance"] = aging_detail["Balance"].map("${:,.2f}".format)
+            st.dataframe(aging_detail, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "⬇️ Download Aging Report CSV",
+                data=unpaid_df.to_csv(index=False).encode("utf-8"),
+                file_name="invoice_aging_report.csv", mime="text/csv"
+            )
+
 
 elif menu == "Follow-Up Tracker":
     st.header("Follow-Up Tracker")
@@ -3977,12 +4200,21 @@ elif menu == "Document Attachments":
     else:
         appointment_id, row = appointment_selector(df)
 
-        uploaded_file = st.file_uploader("Upload File")
+        attach_tab1, attach_tab2 = st.tabs(["📁 Upload File", "📷 Take Photo"])
+
+        with attach_tab1:
+            uploaded_file = st.file_uploader("Upload File",
+                type=["pdf","jpg","jpeg","png","doc","docx","txt","heic"])
+        with attach_tab2:
+            uploaded_file_cam = st.camera_input("Take a photo of the signed document")
+            if uploaded_file_cam:
+                uploaded_file = uploaded_file_cam
+
         attachment_notes = st.text_area("Attachment Notes")
 
         if st.button("Save Attachment"):
             if uploaded_file is None:
-                st.error("Please choose a file first.")
+                st.error("Please choose a file or take a photo first.")
             else:
                 file_bytes = uploaded_file.getbuffer()
                 # Try Supabase Storage first, fall back to local filesystem
@@ -4669,15 +4901,45 @@ elif menu == "Settings / Business Profile":
                 )
 
         st.subheader("📧 Email / SMTP")
-        st.caption("Used for sending invoices and daily digests. Gmail: use an App Password, not your regular password.")
-        smtp_host = st.text_input("SMTP Host", value=settings.get("smtp_host") or "", placeholder="smtp.gmail.com")
-        smtp_port = st.number_input("SMTP Port", min_value=1, max_value=65535, value=int(settings.get("smtp_port") or 587))
+        st.caption("Used for sending invoices and daily digests.")
+
+        # Quick preset selector
+        smtp_preset = st.selectbox("Quick Setup (optional)", [
+            "Custom / Manual",
+            "Gmail (TLS 587)",
+            "Gmail (SSL 465)",
+            "Outlook / Hotmail (TLS 587)",
+            "Yahoo Mail (SSL 465)",
+            "GoDaddy / cPanel (SSL 465)",
+        ], key="smtp_preset")
+
+        preset_defaults = {
+            "Gmail (TLS 587)":           ("smtp.gmail.com", 587),
+            "Gmail (SSL 465)":           ("smtp.gmail.com", 465),
+            "Outlook / Hotmail (TLS 587)": ("smtp.office365.com", 587),
+            "Yahoo Mail (SSL 465)":      ("smtp.mail.yahoo.com", 465),
+            "GoDaddy / cPanel (SSL 465)": ("mail.yourdomain.com", 465),
+        }
+        preset_host, preset_port = preset_defaults.get(smtp_preset, ("", 587))
+
+        smtp_host = st.text_input("SMTP Host",
+            value=preset_host or settings.get("smtp_host") or "",
+            placeholder="smtp.gmail.com")
+        smtp_port = st.number_input("SMTP Port", min_value=1, max_value=65535,
+            value=preset_port or int(settings.get("smtp_port") or 587))
+
+        # Show which mode will be used
+        if smtp_port == 465:
+            st.caption("🔒 SSL mode (SMTP_SSL) — encrypted from the start")
+        else:
+            st.caption(f"🔐 TLS/STARTTLS mode — upgrades to encrypted on port {smtp_port}")
+
         smtp_user = st.text_input("SMTP Username / Email", value=settings.get("smtp_user") or "")
         smtp_password = st.text_input("SMTP Password", value=settings.get("smtp_password") or "", type="password")
         smtp_from_name = st.text_input("From Name", value=settings.get("smtp_from_name") or "", placeholder="Sean Keyser, NSA")
         notification_email = st.text_input("Daily Digest Send To", value=settings.get("notification_email") or "",
             help="Where to send the daily appointment digest — usually your own email")
-        st.caption("For Gmail: enable 2FA → Google Account → Security → App Passwords → generate one for 'Mail'")
+        st.caption("For Gmail: Google Account → Security → 2-Step Verification → App Passwords → generate one for 'Mail'")
 
         if st.form_submit_button("📧 Send Test Email", type="secondary"):
             if not smtp_host or not smtp_user or not smtp_password:
@@ -4758,6 +5020,88 @@ elif menu == "Settings / Business Profile":
 
             st.success("Settings saved.")
             st.rerun()
+
+
+elif menu == "Expense Tracker":
+    st.header("Expense Tracker")
+    st.caption("Track business expenses for Schedule C deductions.")
+
+    exp_tab1, exp_tab2 = st.tabs(["📋 Log Expense", "📊 Expense Report"])
+
+    with exp_tab1:
+        with st.form("expense_form"):
+            exp_date = st.date_input("Date", value=date.today())
+            exp_category = st.selectbox("Category", EXPENSE_CATEGORIES)
+            exp_description = st.text_input("Description", placeholder="e.g. Staples — notary stamps x2")
+            exp_amount = st.number_input("Amount ($)", min_value=0.01, step=0.01)
+            exp_notes = st.text_area("Notes", height=80)
+
+            if st.form_submit_button("💾 Save Expense", type="primary"):
+                if not exp_description.strip():
+                    st.error("Description is required.")
+                else:
+                    add_expense(exp_date, exp_category, exp_description, exp_amount, exp_notes)
+                    st.success(f"Expense of ${exp_amount:,.2f} saved!")
+                    st.rerun()
+
+    with exp_tab2:
+        exp_df = get_expenses_dataframe()
+
+        if exp_df.empty:
+            st.info("No expenses recorded yet.")
+        else:
+            exp_df["amount"] = pd.to_numeric(exp_df["amount"], errors="coerce").fillna(0)
+            exp_df["expense_date"] = pd.to_datetime(exp_df["expense_date"], errors="coerce")
+
+            # Year filter
+            years = sorted(exp_df["expense_date"].dt.year.dropna().unique().astype(int), reverse=True)
+            exp_year = st.selectbox("Tax Year", years, key="exp_year")
+            exp_df_yr = exp_df[exp_df["expense_date"].dt.year == exp_year]
+
+            total_expenses = exp_df_yr["amount"].sum()
+            is_dark_exp = dark_mode
+            cb = "#1e293b" if is_dark_exp else "#f8fafc"
+            cborder = "#334155" if is_dark_exp else "#e2e8f0"
+            clabel = "#94a3b8" if is_dark_exp else "#64748b"
+            cval = "#f1f5f9" if is_dark_exp else "#0f172a"
+
+            # Summary by category
+            cat_summary = exp_df_yr.groupby("category")["amount"].sum().sort_values(ascending=False)
+
+            st.markdown(f"""
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.75rem 1rem;margin-bottom:1rem;">
+                <div style="font-size:0.75rem;color:{clabel};">Total Expenses {exp_year}</div>
+                <div style="font-size:1.6rem;font-weight:700;color:#ef4444;">${total_expenses:,.2f}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.subheader("By Category")
+            st.bar_chart(cat_summary)
+
+            st.subheader("All Expenses")
+            display_exp = exp_df_yr.copy()
+            display_exp["expense_date"] = display_exp["expense_date"].dt.strftime("%Y-%m-%d")
+            display_exp["amount"] = display_exp["amount"].map("${:,.2f}".format)
+
+            for _, exp_row in exp_df_yr.sort_values("expense_date", ascending=False).iterrows():
+                with st.expander(
+                    f"{exp_row['expense_date'].strftime('%b %d')} — "
+                    f"{exp_row['category']} — ${float(exp_row['amount']):,.2f} — {exp_row['description']}"
+                ):
+                    if exp_row.get("notes"):
+                        st.caption(exp_row["notes"])
+                    if st.button("🗑️ Delete", key=f"del_exp_{exp_row['id']}"):
+                        delete_expense(int(exp_row["id"]))
+                        st.rerun()
+
+            # Export
+            st.download_button(
+                "⬇️ Download Expenses CSV",
+                data=exp_df_yr[["expense_date","category","description","amount","notes"]
+                               ].to_csv(index=False).encode("utf-8"),
+                file_name=f"expenses_{exp_year}.csv",
+                mime="text/csv"
+            )
 
 
 elif menu == "Signing Day Sheet":
@@ -4864,6 +5208,73 @@ elif menu == "Signing Day Sheet":
                 file_name=f"signing_day_{sheet_date.isoformat()}.txt",
                 mime="text/plain"
             )
+
+
+elif menu == "Service Area Map":
+    st.header("Service Area Map")
+    st.caption("See where you've worked and identify your busiest areas.")
+
+    df_all = get_all_appointments_dataframe()
+
+    if df_all.empty:
+        st.info("No appointment data yet.")
+    else:
+        df_all["fee"] = pd.to_numeric(df_all["fee"], errors="coerce").fillna(0)
+
+        # Filter controls
+        map_col1, map_col2 = st.columns(2)
+        with map_col1:
+            map_status = st.selectbox("Filter by Status", ["All"] + STATUSES, key="map_status")
+        with map_col2:
+            map_type = st.selectbox("Filter by Type", ["All"] + SIGNING_TYPES, key="map_type")
+
+        map_df = df_all.copy()
+        if map_status != "All":
+            map_df = map_df[map_df["status"] == map_status]
+        if map_type != "All":
+            map_df = map_df[map_df["signing_type"] == map_type]
+
+        locations = map_df[map_df["location"].notna() & (map_df["location"] != "")]["location"].value_counts().reset_index()
+        locations.columns = ["location", "count"]
+
+        st.subheader(f"{len(locations)} Unique Locations")
+
+        # Summary stats
+        sm1, sm2, sm3 = st.columns(3)
+        sm1.metric("Total Appointments", len(map_df))
+        sm2.metric("Unique Locations", len(locations))
+        sm3.metric("Total Revenue", f"${map_df['fee'].sum():,.2f}")
+
+        st.divider()
+
+        # Top locations table
+        st.subheader("Most Visited Locations")
+        top_locations = locations.head(20).copy()
+        top_locations["revenue"] = top_locations["location"].apply(
+            lambda loc: map_df[map_df["location"] == loc]["fee"].sum()
+        )
+        top_locations.columns = ["Location", "Visits", "Revenue ($)"]
+        top_locations["Revenue ($)"] = top_locations["Revenue ($)"].map("${:,.2f}".format)
+        st.dataframe(top_locations, use_container_width=True, hide_index=True)
+
+        # Google Maps links for top locations
+        st.divider()
+        st.subheader("Quick Directions")
+        st.caption("One-tap directions to your most visited locations.")
+        for _, loc_row in locations.head(8).iterrows():
+            from urllib.parse import quote_plus as qp
+            maps_url = f"https://www.google.com/maps/search/{qp(loc_row['location'])}"
+            st.markdown(f"[📍 {loc_row['location']} ({int(loc_row['count'])} visits)]({maps_url})")
+
+        st.divider()
+        # All locations as downloadable CSV
+        st.download_button(
+            "⬇️ Download Location Data CSV",
+            data=map_df[["appointment_date","client_name","signing_type","location","fee","status"]
+                       ].to_csv(index=False).encode("utf-8"),
+            file_name="service_area_locations.csv",
+            mime="text/csv"
+        )
 
 
 elif menu == "Appointment Templates":
