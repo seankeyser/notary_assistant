@@ -12,7 +12,7 @@ from streamlit_calendar import calendar
 
 
 DB_NAME = os.environ.get("NOTARY_DB_PATH", "notary_assistant.db")
-APP_VERSION = "2.9.0"
+APP_VERSION = "3.0.0"
 _SAFE_EXPORT_TABLES = frozenset(
     ["clients", "appointments", "payments", "checklist", "attachments", "followups", "settings"]
 )
@@ -110,6 +110,14 @@ CHECKLIST_ITEMS = [
 
 
 
+
+def clear_all_caches():
+    """Force refresh all cached data from Supabase/SQLite."""
+    get_all_appointments_dataframe.clear()
+    get_clients.clear()
+    get_all_payment_totals.clear()
+    get_settings.clear()
+
 def get_signing_type_fees(settings):
     """Return dict of {signing_type: fee} from settings, falling back to defaults."""
     raw = settings.get("signing_type_fees") or ""
@@ -123,6 +131,36 @@ def get_signing_type_fees(settings):
         except Exception:
             pass
     return dict(DEFAULT_SIGNING_TYPE_FEES)
+
+
+def upload_to_supabase_storage(file_bytes, file_name, appointment_id):
+    """Upload a file to Supabase Storage bucket 'attachments'.
+    Returns the public URL on success, None on failure.
+    """
+    if not using_supabase():
+        return None
+    try:
+        path = f"{appointment_id}/{file_name}"
+        sb().storage.from_("attachments").upload(
+            path, file_bytes,
+            {"content-type": "application/octet-stream", "x-upsert": "true"}
+        )
+        url = sb().storage.from_("attachments").get_public_url(path)
+        return url
+    except Exception:
+        return None
+
+
+def get_supabase_attachment_url(file_path):
+    """Return a fresh signed URL for a Supabase Storage file (1 hour expiry)."""
+    if not using_supabase() or not file_path or not file_path.startswith("supabase://"):
+        return None
+    try:
+        path = file_path.replace("supabase://attachments/", "")
+        result = sb().storage.from_("attachments").create_signed_url(path, 3600)
+        return result.get("signedURL") or result.get("signedUrl")
+    except Exception:
+        return None
 
 def ensure_folders():
     os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -199,6 +237,13 @@ def create_tables():
             "revenue_goal": "REAL",
             "supabase_url": "TEXT",
             "supabase_key": "TEXT",
+            "smtp_host": "TEXT",
+            "smtp_port": "INTEGER",
+            "smtp_user": "TEXT",
+            "smtp_password": "TEXT",
+            "smtp_from_name": "TEXT",
+            "gcal_enabled": "INTEGER",
+            "notification_email": "TEXT",
         }
 
         for column, column_type in settings_needed.items():
@@ -349,17 +394,25 @@ def migrate_sqlite_to_supabase():
             client.table("settings").upsert(_clean_for_supabase(settings_df)).execute()
             results.append(f"✅ Settings: {len(settings_df)} row(s)")
 
-        # Clients
+        # Clients FIRST — appointments depend on client_id
         with db_conn() as conn:
             clients_df = pd.read_sql_query("SELECT * FROM clients", conn)
         if not clients_df.empty:
             client.table("clients").upsert(_clean_for_supabase(clients_df)).execute()
             results.append(f"✅ Clients: {len(clients_df)} row(s)")
 
-        # Appointments
+        # Appointments — strip client_id FK to avoid constraint errors,
+        # Supabase will still store it but won't enforce the FK since we dropped it in SQL
         with db_conn() as conn:
             appts_df = pd.read_sql_query("SELECT * FROM appointments", conn)
         if not appts_df.empty:
+            # Get valid client IDs from Supabase
+            valid_clients = client.table("clients").select("id").execute()
+            valid_ids = {r["id"] for r in valid_clients.data}
+            # Null out any client_id not present in Supabase clients table
+            appts_df["client_id"] = appts_df["client_id"].apply(
+                lambda x: int(x) if pd.notna(x) and int(x) in valid_ids else None
+            )
             client.table("appointments").upsert(_clean_for_supabase(appts_df)).execute()
             results.append(f"✅ Appointments: {len(appts_df)} row(s)")
 
@@ -426,6 +479,13 @@ def get_settings():
             "revenue_goal": 0.0,
             "supabase_url": "",
             "supabase_key": "",
+            "smtp_host": "",
+            "smtp_port": 587,
+            "smtp_user": "",
+            "smtp_password": "",
+            "smtp_from_name": "",
+            "gcal_enabled": 0,
+            "notification_email": "",
         }
 
     return row.iloc[0].to_dict()
@@ -480,6 +540,123 @@ def update_settings(settings):
         conn.commit()
     get_settings.clear()
 
+
+
+def send_email(to_email, subject, body_text, pdf_bytes=None, pdf_filename=None, settings=None):
+    """Send an email via SMTP. Returns (success, error_message)."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+
+    if settings is None:
+        settings = {}
+
+    host = settings.get("smtp_host", "")
+    port = int(settings.get("smtp_port") or 587)
+    user = settings.get("smtp_user", "")
+    password = settings.get("smtp_password", "")
+    from_name = settings.get("smtp_from_name") or settings.get("business_name", "Notary Assistant")
+
+    if not host or not user or not password:
+        return False, "SMTP not configured. Add SMTP settings in Settings / Business Profile."
+
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = f"{from_name} <{user}>"
+        msg["To"] = to_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_text, "plain"))
+
+        if pdf_bytes and pdf_filename:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(pdf_bytes)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={pdf_filename}")
+            msg.attach(part)
+
+        with smtplib.SMTP(host, port) as server:
+            server.ehlo()
+            server.starttls()
+            server.login(user, password)
+            server.sendmail(user, to_email, msg.as_string())
+
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+
+def send_daily_digest(settings):
+    """Send a daily digest email with tomorrow's appointments and overdue invoices."""
+    notify_email = settings.get("notification_email", "")
+    if not notify_email:
+        return False, "No notification email set in Settings."
+
+    df = get_all_appointments_dataframe()
+    if df.empty:
+        return False, "No appointments to report."
+
+    df["appointment_date"] = pd.to_datetime(df["appointment_date"], errors="coerce")
+    tomorrow = pd.Timestamp(date.today() + timedelta(days=1))
+    tomorrow_appts = df[df["appointment_date"].dt.date == tomorrow.date()].sort_values("appointment_time")
+
+    invoice_df = get_invoice_status_dataframe(df)
+    overdue = invoice_df[invoice_df["invoice_status"] == "Overdue"] if not invoice_df.empty else pd.DataFrame()
+
+    lines = [
+        f"Good morning! Here's your notary day ahead — {tomorrow.strftime('%A, %B %d, %Y')}",
+        "",
+        f"TOMORROW'S APPOINTMENTS ({len(tomorrow_appts)})",
+        "=" * 45,
+    ]
+    if tomorrow_appts.empty:
+        lines.append("No appointments scheduled.")
+    else:
+        for _, r in tomorrow_appts.iterrows():
+            lines.append(f"• {r['appointment_time']} — {r['client_name']} | {r['signing_type']} | {r['location'] or 'TBD'} | ${float(r['fee'] or 0):,.2f}")
+
+    lines += ["", f"OVERDUE INVOICES ({len(overdue)})", "=" * 45]
+    if overdue.empty:
+        lines.append("No overdue invoices. 🎉")
+    else:
+        for _, r in overdue.iterrows():
+            lines.append(f"• {r['client_name']} — ${float(r['balance_due'] or 0):,.2f} overdue")
+
+    lines += ["", f"— {settings.get('business_name', 'Notary Assistant')}"]
+
+    return send_email(
+        notify_email,
+        f"Notary Day Ahead — {tomorrow.strftime('%b %d')}",
+        "\n".join(lines),
+        settings=settings
+    )
+
+
+def get_gcal_add_url(row):
+    """Return a Google Calendar event creation URL for an appointment."""
+    from urllib.parse import urlencode
+    try:
+        appt_date = str(row.get("appointment_date", ""))[:10].replace("-", "")
+        start_time = str(row.get("appointment_time", "09:00")).replace(":", "")
+        end_time = str(row.get("end_time", "10:00")).replace(":", "")
+        if len(start_time) == 4: start_time += "00"
+        if len(end_time) == 4: end_time += "00"
+        start = f"{appt_date}T{start_time}"
+        end = f"{appt_date}T{end_time}"
+        title = f"{row.get('signing_type','Signing')} — {row.get('client_name','')}"
+        details = f"Fee: ${float(row.get('fee') or 0):,.2f}\nPhone: {row.get('client_phone','')}"
+        location = row.get("location", "")
+        params = {
+            "action": "TEMPLATE",
+            "text": title,
+            "dates": f"{start}/{end}",
+            "details": details,
+            "location": location,
+        }
+        return "https://calendar.google.com/calendar/render?" + urlencode(params)
+    except Exception:
+        return None
 
 def calculate_end_time(appointment_date, appointment_time, duration_minutes):
     start_dt = datetime.combine(appointment_date, appointment_time)
@@ -1782,7 +1959,7 @@ MENU_OPTIONS = [
 
 MENU_GROUPS = {
     "📊 Overview": ["Dashboard", "Calendar View"],
-    "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History"],
+    "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History", "Client Portal"],
     "📅 Appointments": ["Add Appointment", "View Appointments", "Edit Appointment", "Delete Appointment", "Job Checklist", "Appointment Templates"],
     "💰 Finance": ["Payment Tracking", "Invoice Status", "Invoice Generator", "Quote Generator", "Reports / Export", "Mileage / Tax Report"],
     "📬 Tools": ["Follow-Up Tracker", "Email Templates", "Map / Route Tools", "Document Attachments", "Referral Analytics", "Signing Day Sheet"],
@@ -2132,6 +2309,9 @@ for group_label, group_items in MENU_GROUPS.items():
 menu = st.session_state.selected_menu
 
 st.sidebar.divider()
+if st.sidebar.button("🔄 Refresh", use_container_width=True, help="Pull latest data from Supabase"):
+    clear_all_caches()
+    st.rerun()
 st.sidebar.caption(f"Version {APP_VERSION}")
 
 if settings.get("logo_path") and os.path.exists(settings["logo_path"]):
@@ -2350,6 +2530,76 @@ if menu == "Dashboard":
             st.subheader("Mileage by Signing Type")
             st.bar_chart(df.groupby("signing_type")["mileage"].sum().sort_values(ascending=False))
 
+        # ── Year-over-Year Revenue Comparison ──────────────────────────────
+        st.divider()
+        st.subheader("Year-over-Year Revenue")
+        df["year"] = df["appointment_date"].dt.year
+        df["month_num"] = df["appointment_date"].dt.month
+        years = sorted(df["year"].dropna().unique().astype(int), reverse=True)
+
+        if len(years) >= 2:
+            yoy_data = {}
+            month_names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+            for yr in years[:3]:  # Show up to 3 years
+                monthly = df[df["year"] == yr].groupby("month_num")["fee"].sum()
+                yoy_data[str(yr)] = [monthly.get(m, 0) for m in range(1, 13)]
+
+            yoy_df = pd.DataFrame(yoy_data, index=month_names)
+            st.bar_chart(yoy_df)
+
+            # Running annual totals
+            st.caption("Annual totals:")
+            ann_cols = st.columns(min(len(years[:3]), 3))
+            for i, yr in enumerate(years[:3]):
+                annual_total = df[df["year"] == yr]["fee"].sum()
+                ann_cols[i].metric(str(yr), f"${annual_total:,.0f}")
+        else:
+            st.info("Add appointments across multiple years to see year-over-year comparison.")
+
+        # ── Busiest Days / Times Heatmap ───────────────────────────────────
+        st.divider()
+        st.subheader("Busiest Days & Times")
+        df["day_of_week"] = df["appointment_date"].dt.day_name()
+        df["hour"] = pd.to_datetime(df["appointment_time"], format="%H:%M", errors="coerce").dt.hour
+
+        day_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        day_counts = df["day_of_week"].value_counts().reindex(day_order, fill_value=0)
+
+        heat_col1, heat_col2 = st.columns(2)
+        with heat_col1:
+            st.caption("Appointments by day of week")
+            st.bar_chart(day_counts)
+
+        with heat_col2:
+            st.caption("Appointments by hour of day")
+            hour_counts = df["hour"].value_counts().sort_index()
+            if not hour_counts.empty:
+                hour_counts.index = [f"{h:02d}:00" for h in hour_counts.index]
+                st.bar_chart(hour_counts)
+
+        # ── Notification digest button ──────────────────────────────────────
+        st.divider()
+        notify_col1, notify_col2 = st.columns([3, 1])
+        with notify_col1:
+            st.caption("Send yourself a daily digest with tomorrow's appointments and overdue invoices.")
+        with notify_col2:
+            if st.button("📬 Send Daily Digest"):
+                with st.spinner("Sending..."):
+                    ok, err = send_daily_digest(settings)
+                if ok:
+                    st.success("Digest sent!")
+                else:
+                    st.warning(err)
+
+        # ── Real-time refresh button ────────────────────────────────────────
+        rt_col1, rt_col2 = st.columns([3, 1])
+        with rt_col1:
+            st.caption("Force a fresh data pull from Supabase.")
+        with rt_col2:
+            if st.button("🔄 Refresh Data"):
+                clear_all_caches()
+                st.rerun()
+
 
 elif menu == "Calendar View":
     st.header("Calendar View")
@@ -2452,6 +2702,68 @@ elif menu == "Add Client":
                     st.session_state.pop("confirm_add_client", None)
                     add_client(client_name, phone, email, address, referral_source, notes)
                     st.success("Client saved successfully!")
+
+
+elif menu == "Client Portal":
+    st.header("Client Portal Links")
+    st.caption("Share a read-only link with a client showing their appointment history and balance.")
+
+    clients = get_clients()
+    if not clients:
+        st.info("No clients yet.")
+    else:
+        client_names = {f"{c[1]} ({c[3] or 'No email'})": c[0] for c in clients}
+        selected = st.selectbox("Select Client", list(client_names.keys()))
+        client_id = client_names[selected]
+
+        # Generate a simple token — base64 of client_id + secret
+        import base64, hashlib
+        secret = st.secrets.get("SUPABASE_KEY", "notary")[:16]
+        token = base64.urlsafe_b64encode(
+            hashlib.sha256(f"{client_id}:{secret}".encode()).digest()[:12]
+        ).decode().rstrip("=")
+
+        app_url = st.secrets.get("APP_URL", "https://your-app.streamlit.app")
+        portal_url = f"{app_url}?portal={client_id}&token={token}"
+
+        st.subheader("Portal Link")
+        st.code(portal_url)
+        st.caption("Send this link to your client. It shows their appointments and balance — no login required.")
+
+        # Copy button via markdown
+        st.markdown(f"[📋 Open Portal Preview]({portal_url})")
+
+        # Preview what the client sees
+        st.divider()
+        st.subheader("Preview — What Your Client Sees")
+
+        df_all = get_all_appointments_dataframe()
+        if not df_all.empty:
+            client_df = df_all[df_all["client_id"] == client_id].copy()
+            client_info = next((c for c in clients if c[0] == client_id), None)
+
+            if client_info:
+                st.write(f"**{client_info[1]}**")
+                st.write(f"📧 {client_info[3] or '—'}  📞 {client_info[2] or '—'}")
+
+            if client_df.empty:
+                st.info("No appointments for this client.")
+            else:
+                all_paid = get_all_payment_totals()
+                client_df["paid"] = client_df["id"].apply(lambda x: all_paid.get(x, 0.0))
+                client_df["balance"] = (client_df["fee"].fillna(0).astype(float) - client_df["paid"]).clip(lower=0)
+                total_balance = client_df["balance"].sum()
+
+                if total_balance > 0:
+                    st.warning(f"Outstanding balance: **${total_balance:,.2f}**")
+                else:
+                    st.success("Account is paid in full ✅")
+
+                st.dataframe(
+                    client_df[["appointment_date", "appointment_time", "signing_type",
+                               "location", "fee", "paid", "balance", "status"]].sort_values("appointment_date", ascending=False),
+                    use_container_width=True, hide_index=True
+                )
 
 
 elif menu == "View Clients":
@@ -2761,6 +3073,17 @@ elif menu == "View Appointments":
                 appt_detail = get_appointment_by_id(appointment_id)
                 client_notes_val = (appt_detail[18] or "") if appt_detail and len(appt_detail) > 18 else ""
                 internal_notes_val = (appt_detail[19] or "") if appt_detail and len(appt_detail) > 19 else ""
+                # Build row dict for gcal URL builder
+                appt_row = {
+                    "appointment_date": appointment_date,
+                    "appointment_time": appointment_time,
+                    "end_time": appt_detail[8] if appt_detail else "",
+                    "signing_type": signing_type,
+                    "client_name": client_name,
+                    "client_phone": appt_detail[3] if appt_detail else "",
+                    "fee": fee,
+                    "location": location,
+                }
 
                 if client_notes_val:
                     st.info(f"📋 **Client Notes:** {client_notes_val}")
@@ -3259,37 +3582,54 @@ elif menu == "Document Attachments":
             if uploaded_file is None:
                 st.error("Please choose a file first.")
             else:
-                appointment_folder = os.path.join(UPLOAD_FOLDER, str(appointment_id))
-                os.makedirs(appointment_folder, exist_ok=True)
-                file_path = os.path.join(appointment_folder, uploaded_file.name)
-
-                with open(file_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
+                file_bytes = uploaded_file.getbuffer()
+                # Try Supabase Storage first, fall back to local filesystem
+                storage_url = upload_to_supabase_storage(file_bytes, uploaded_file.name, appointment_id)
+                if storage_url:
+                    file_path = f"supabase://attachments/{appointment_id}/{uploaded_file.name}"
+                    st.success("Uploaded to Supabase Storage ☁️")
+                else:
+                    appointment_folder = os.path.join(UPLOAD_FOLDER, str(appointment_id))
+                    os.makedirs(appointment_folder, exist_ok=True)
+                    file_path = os.path.join(appointment_folder, uploaded_file.name)
+                    with open(file_path, "wb") as f:
+                        f.write(file_bytes)
+                    st.success("Attachment saved locally.")
 
                 add_attachment(appointment_id, uploaded_file.name, file_path, attachment_notes)
-                st.success("Attachment saved.")
 
         st.divider()
         st.subheader("Attachments for Selected Appointment")
-
         attachments_df = get_attachments(appointment_id)
 
         if attachments_df.empty:
             st.info("No attachments for this appointment.")
         else:
             for _, attachment in attachments_df.iterrows():
-                st.write(f"**{attachment['file_name']}**")
-                st.write(f"Uploaded: {attachment['uploaded_at']}")
-                st.write(f"Notes: {attachment['notes'] or ''}")
+                with st.container():
+                    st.write(f"**{attachment['file_name']}**")
+                    st.write(f"Uploaded: {attachment['uploaded_at']}")
+                    if attachment.get("notes"):
+                        st.write(f"Notes: {attachment['notes']}")
 
-                if os.path.exists(attachment["file_path"]):
-                    with open(attachment["file_path"], "rb") as f:
-                        st.download_button(
-                            "Download",
-                            data=f.read(),
-                            file_name=attachment["file_name"],
-                            key=f"download_{attachment['id']}"
-                        )
+                    fp = attachment["file_path"] or ""
+                    if fp.startswith("supabase://"):
+                        signed_url = get_supabase_attachment_url(fp)
+                        if signed_url:
+                            st.markdown(f"[⬇️ Download from Cloud]({signed_url})")
+                        else:
+                            st.warning("Could not generate download link.")
+                    elif os.path.exists(fp):
+                        with open(fp, "rb") as f:
+                            st.download_button(
+                                "⬇️ Download",
+                                data=f.read(),
+                                file_name=attachment["file_name"],
+                                key=f"download_{attachment['id']}"
+                            )
+                    else:
+                        st.caption("File not available locally.")
+                    st.divider()
 
 
 elif menu == "Reports / Export":
@@ -3418,7 +3758,6 @@ elif menu == "Invoice Generator":
         with col2:
             if st.button("Generate PDF Invoice"):
                 pdf_bytes, error = create_pdf_invoice(row, settings)
-
                 if error:
                     st.error(error)
                 else:
@@ -3428,6 +3767,43 @@ elif menu == "Invoice Generator":
                         file_name=f"invoice_{appointment_id}.pdf",
                         mime="application/pdf"
                     )
+
+        st.divider()
+        st.subheader("📧 Email Invoice")
+        client_email = row.get("client_email", "")
+        email_to = st.text_input("Send To", value=client_email or "")
+
+        col_send1, col_send2 = st.columns(2)
+        with col_send1:
+            send_text = st.button("Send Text Invoice")
+        with col_send2:
+            send_pdf_btn = st.button("Send PDF Invoice")
+
+        if send_text or send_pdf_btn:
+            if not email_to:
+                st.error("No email address — add one to the client record first.")
+            else:
+                invoice_body = invoice_text(row, settings)
+                pdf_data, pdf_err = None, None
+                if send_pdf_btn:
+                    pdf_data, pdf_err = create_pdf_invoice(row, settings)
+                    if pdf_err:
+                        st.error(pdf_err)
+
+                if not pdf_err:
+                    with st.spinner("Sending..."):
+                        ok, err = send_email(
+                            email_to,
+                            f"Invoice from {settings.get('business_name', 'Your Notary')}",
+                            invoice_body,
+                            pdf_bytes=pdf_data,
+                            pdf_filename=f"invoice_{appointment_id}.pdf" if pdf_data else None,
+                            settings=settings
+                        )
+                    if ok:
+                        st.success(f"Invoice sent to {email_to} ✅")
+                    else:
+                        st.error(f"Send failed: {err}")
 
 
 elif menu == "Email Templates":
@@ -3633,7 +4009,7 @@ create table if not exists clients (
 
 create table if not exists appointments (
     id bigserial primary key,
-    client_id bigint references clients(id),
+    client_id bigint,
     client_name text, client_phone text, client_email text,
     appointment_date text, appointment_time text,
     duration_minutes integer, end_time text,
@@ -3645,27 +4021,27 @@ create table if not exists appointments (
 
 create table if not exists payments (
     id bigserial primary key,
-    appointment_id bigint references appointments(id),
+    appointment_id bigint,
     payment_date text, amount_paid real,
     payment_method text, notes text
 );
 
 create table if not exists checklist (
     id bigserial primary key,
-    appointment_id bigint references appointments(id),
+    appointment_id bigint,
     item_name text, completed boolean default false
 );
 
 create table if not exists attachments (
     id bigserial primary key,
-    appointment_id bigint references appointments(id),
+    appointment_id bigint,
     file_name text, file_path text,
     uploaded_at text, notes text
 );
 
 create table if not exists followups (
     id bigserial primary key,
-    appointment_id bigint references appointments(id),
+    appointment_id bigint,
     followup_date text, followup_type text,
     outcome text, notes text, completed boolean default false
 );
@@ -3678,6 +4054,15 @@ create table if not exists templates (
     notes text, client_notes text, internal_notes text,
     created_at text
 );
+
+-- Optional: add smtp columns to settings if migrating from older version
+alter table settings add column if not exists smtp_host text;
+alter table settings add column if not exists smtp_port integer;
+alter table settings add column if not exists smtp_user text;
+alter table settings add column if not exists smtp_password text;
+alter table settings add column if not exists smtp_from_name text;
+alter table settings add column if not exists notification_email text;
+alter table settings add column if not exists gcal_enabled integer;
 
 -- Disable Row Level Security (app uses secret key server-side)
 alter table settings disable row level security;
@@ -3744,7 +4129,18 @@ elif menu == "Settings / Business Profile":
                     key=f"stfee_{stype}"
                 )
 
-        st.subheader("Security")
+        st.subheader("📧 Email / SMTP")
+        st.caption("Used for sending invoices and daily digests. Gmail: use an App Password, not your regular password.")
+        smtp_host = st.text_input("SMTP Host", value=settings.get("smtp_host") or "", placeholder="smtp.gmail.com")
+        smtp_port = st.number_input("SMTP Port", min_value=1, max_value=65535, value=int(settings.get("smtp_port") or 587))
+        smtp_user = st.text_input("SMTP Username / Email", value=settings.get("smtp_user") or "")
+        smtp_password = st.text_input("SMTP Password", value=settings.get("smtp_password") or "", type="password")
+        smtp_from_name = st.text_input("From Name", value=settings.get("smtp_from_name") or "", placeholder="Sean Keyser, NSA")
+        notification_email = st.text_input("Daily Digest Send To", value=settings.get("notification_email") or "",
+            help="Where to send the daily appointment digest — usually your own email")
+        st.caption("For Gmail: enable 2FA → Google Account → Security → App Passwords → generate one for 'Mail'")
+
+        st.subheader("🔐 Security")
         auth_enabled = st.checkbox("Enable Simple Login", value=bool(settings.get("auth_enabled")))
         app_password = st.text_input("App Password", value=settings.get("app_password") or "", type="password")
 
@@ -3791,6 +4187,12 @@ elif menu == "Settings / Business Profile":
                 "revenue_goal": revenue_goal,
                 "supabase_url": supabase_url,
                 "supabase_key": supabase_key,
+                "smtp_host": smtp_host,
+                "smtp_port": smtp_port,
+                "smtp_user": smtp_user,
+                "smtp_password": smtp_password,
+                "smtp_from_name": smtp_from_name,
+                "notification_email": notification_email,
             })
 
             st.success("Settings saved.")
@@ -3861,6 +4263,10 @@ elif menu == "Signing Day Sheet":
                         from urllib.parse import quote_plus as qp
                         directions = f"https://www.google.com/maps/dir/?api=1&destination={qp(row['location'])}"
                         st.markdown(f"[🗺️ Get Directions]({directions})")
+
+                    gcal_url = get_gcal_add_url(appt_row)
+                    if gcal_url:
+                        st.markdown(f"[📅 Add to Google Calendar]({gcal_url})")
 
                     st.divider()
 
