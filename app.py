@@ -317,6 +317,20 @@ def create_supabase_tables():
     return False, "Tables need to be created — see Cloud Database Setup page for SQL"
 
 
+def _clean_for_supabase(df):
+    """Replace NaN/inf values with None so Supabase JSON serialization doesn't fail."""
+    import math
+    df = df.where(pd.notnull(df), None)
+    records = df.to_dict("records")
+    cleaned = []
+    for row in records:
+        cleaned.append({
+            k: (None if isinstance(v, float) and (math.isnan(v) or math.isinf(v)) else v)
+            for k, v in row.items()
+        })
+    return cleaned
+
+
 def migrate_sqlite_to_supabase():
     """One-time migration: copy all SQLite data into Supabase.
     Safe to run multiple times — uses upsert so existing records aren't duplicated.
@@ -332,49 +346,49 @@ def migrate_sqlite_to_supabase():
         with db_conn() as conn:
             settings_df = pd.read_sql_query("SELECT * FROM settings", conn)
         if not settings_df.empty:
-            client.table("settings").upsert(settings_df.to_dict("records")).execute()
+            client.table("settings").upsert(_clean_for_supabase(settings_df)).execute()
             results.append(f"✅ Settings: {len(settings_df)} row(s)")
 
         # Clients
         with db_conn() as conn:
             clients_df = pd.read_sql_query("SELECT * FROM clients", conn)
         if not clients_df.empty:
-            client.table("clients").upsert(clients_df.to_dict("records")).execute()
+            client.table("clients").upsert(_clean_for_supabase(clients_df)).execute()
             results.append(f"✅ Clients: {len(clients_df)} row(s)")
 
         # Appointments
         with db_conn() as conn:
             appts_df = pd.read_sql_query("SELECT * FROM appointments", conn)
         if not appts_df.empty:
-            client.table("appointments").upsert(appts_df.to_dict("records")).execute()
+            client.table("appointments").upsert(_clean_for_supabase(appts_df)).execute()
             results.append(f"✅ Appointments: {len(appts_df)} row(s)")
 
         # Payments
         with db_conn() as conn:
             payments_df = pd.read_sql_query("SELECT * FROM payments", conn)
         if not payments_df.empty:
-            client.table("payments").upsert(payments_df.to_dict("records")).execute()
+            client.table("payments").upsert(_clean_for_supabase(payments_df)).execute()
             results.append(f"✅ Payments: {len(payments_df)} row(s)")
 
         # Checklist
         with db_conn() as conn:
             checklist_df = pd.read_sql_query("SELECT * FROM checklist", conn)
         if not checklist_df.empty:
-            client.table("checklist").upsert(checklist_df.to_dict("records")).execute()
+            client.table("checklist").upsert(_clean_for_supabase(checklist_df)).execute()
             results.append(f"✅ Checklist: {len(checklist_df)} row(s)")
 
         # Followups
         with db_conn() as conn:
             followups_df = pd.read_sql_query("SELECT * FROM followups", conn)
         if not followups_df.empty:
-            client.table("followups").upsert(followups_df.to_dict("records")).execute()
+            client.table("followups").upsert(_clean_for_supabase(followups_df)).execute()
             results.append(f"✅ Follow-ups: {len(followups_df)} row(s)")
 
         # Templates
         with db_conn() as conn:
             templates_df = pd.read_sql_query("SELECT * FROM templates", conn)
         if not templates_df.empty:
-            client.table("templates").upsert(templates_df.to_dict("records")).execute()
+            client.table("templates").upsert(_clean_for_supabase(templates_df)).execute()
             results.append(f"✅ Templates: {len(templates_df)} row(s)")
 
         return True, "\n".join(results)
