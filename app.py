@@ -1752,6 +1752,127 @@ settings = get_settings()
 
 st.set_page_config(page_title="Notary Digital Assistant", layout="centered")
 
+# ── Client Portal intercept ───────────────────────────────────────────────────
+# Must run before anything else renders. If ?portal= is in the URL,
+# show a locked-down client view and stop — never load the main app.
+def _verify_portal_token(client_id, token):
+    import base64, hashlib
+    try:
+        secret = st.secrets.get("SUPABASE_KEY", "notary")[:16]
+        expected = base64.urlsafe_b64encode(
+            hashlib.sha256(f"{client_id}:{secret}".encode()).digest()[:12]
+        ).decode().rstrip("=")
+        return token == expected
+    except Exception:
+        return False
+
+_qp = st.query_params
+if "portal" in _qp:
+    _portal_client_id = _qp.get("portal")
+    _portal_token = _qp.get("token", "")
+
+    # Hide sidebar entirely for portal view
+    st.markdown("<style>[data-testid='stSidebar']{display:none!important;}</style>", unsafe_allow_html=True)
+
+    try:
+        _client_id_int = int(_portal_client_id)
+    except (ValueError, TypeError):
+        st.error("Invalid portal link.")
+        st.stop()
+
+    if not _verify_portal_token(_portal_client_id, _portal_token):
+        st.error("⛔ This link is invalid or has expired.")
+        st.stop()
+
+    # Valid token — show read-only client view
+    _clients = get_clients()
+    _client_info = next((c for c in _clients if c[0] == _client_id_int), None)
+
+    if not _client_info:
+        st.error("Client not found.")
+        st.stop()
+
+    biz_name = settings.get("business_name", "Notary Assistant")
+    biz_phone = settings.get("business_phone", "")
+    biz_email = settings.get("business_email", "")
+
+    st.title(f"📋 {biz_name}")
+    if biz_phone: st.write(f"📞 {biz_phone}")
+    if biz_email: st.write(f"📧 {biz_email}")
+    st.divider()
+
+    st.subheader(f"Account Summary — {_client_info[1]}")
+
+    _df = get_all_appointments_dataframe()
+    if _df.empty:
+        st.info("No appointments on record.")
+        st.stop()
+
+    _client_df = _df[_df["client_id"] == _client_id_int].copy()
+    if _client_df.empty:
+        st.info("No appointments on record.")
+        st.stop()
+
+    _all_paid = get_all_payment_totals()
+    _client_df["fee"] = pd.to_numeric(_client_df["fee"], errors="coerce").fillna(0)
+    _client_df["paid"] = _client_df["id"].apply(lambda x: _all_paid.get(int(x), 0.0))
+    _client_df["balance"] = (_client_df["fee"] - _client_df["paid"]).clip(lower=0)
+    _client_df["appointment_date"] = pd.to_datetime(_client_df["appointment_date"], errors="coerce")
+
+    _total_balance = _client_df["balance"].sum()
+    _total_billed = _client_df["fee"].sum()
+    _total_paid = _client_df["paid"].sum()
+
+    # Summary cards
+    st.markdown(f"""
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0.5rem;margin-bottom:1rem;">
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:0.6rem 0.75rem;">
+            <div style="font-size:0.75rem;color:#64748b;font-weight:500;">Total Billed</div>
+            <div style="font-size:1.3rem;font-weight:700;color:#0f172a;">${_total_billed:,.2f}</div>
+        </div>
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:0.6rem 0.75rem;">
+            <div style="font-size:0.75rem;color:#64748b;font-weight:500;">Total Paid</div>
+            <div style="font-size:1.3rem;font-weight:700;color:#22c55e;">${_total_paid:,.2f}</div>
+        </div>
+        <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:0.6rem 0.75rem;">
+            <div style="font-size:0.75rem;color:#64748b;font-weight:500;">Balance Due</div>
+            <div style="font-size:1.3rem;font-weight:700;color:{'#ef4444' if _total_balance > 0 else '#22c55e'};">${_total_balance:,.2f}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    if _total_balance > 0:
+        st.warning(f"Outstanding balance: **${_total_balance:,.2f}**. Please contact us to arrange payment.")
+    else:
+        st.success("✅ Your account is paid in full. Thank you!")
+
+    st.divider()
+    st.subheader("Appointment History")
+
+    for _, _r in _client_df.sort_values("appointment_date", ascending=False).iterrows():
+        with st.expander(
+            f"{_r['appointment_date'].strftime('%b %d, %Y') if pd.notna(_r['appointment_date']) else '—'}"
+            f" — {_r['signing_type']} — ${float(_r['fee']):,.2f}"
+        ):
+            st.write(f"**Time:** {_r.get('appointment_time', '—')}")
+            st.write(f"**Location:** {_r.get('location', '—')}")
+            st.write(f"**Status:** {_r.get('status', '—')}")
+            st.write(f"**Fee:** ${float(_r['fee']):,.2f}")
+            st.write(f"**Paid:** ${float(_r['paid']):,.2f}")
+            bal = float(_r['balance'])
+            if bal > 0:
+                st.write(f"**Balance Due:** :red[${bal:,.2f}]")
+            else:
+                st.write("**Balance Due:** :green[Paid in full]")
+
+    st.divider()
+    st.caption(f"Questions? Contact {biz_name}")
+    if biz_phone: st.caption(f"📞 {biz_phone}")
+    if biz_email: st.caption(f"📧 {biz_email}")
+
+    st.stop()  # ← Never loads the main app for portal visitors
+
+
 # ── Responsive / mobile CSS ───────────────────────────────────────────────────
 st.markdown("""
 <style>
