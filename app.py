@@ -12,7 +12,7 @@ from streamlit_calendar import calendar
 
 
 DB_NAME = os.environ.get("NOTARY_DB_PATH", "notary_assistant.db")
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 _SAFE_EXPORT_TABLES = frozenset(
     ["clients", "appointments", "payments", "checklist", "attachments", "followups", "settings"]
 )
@@ -673,6 +673,34 @@ def get_gcal_add_url(row):
         return "https://calendar.google.com/calendar/render?" + urlencode(params)
     except Exception:
         return None
+
+
+def get_sms_link(row, settings):
+    """Return a pre-filled SMS link for appointment confirmation."""
+    from urllib.parse import quote
+    phone = str(row.get("client_phone") or "").strip().replace("-","").replace("(","").replace(")","").replace(" ","")
+    if not phone:
+        return None, "No phone number on file"
+    try:
+        appt_date = pd.to_datetime(str(row.get("appointment_date",""))).strftime("%A, %B %d at")
+    except Exception:
+        appt_date = str(row.get("appointment_date",""))
+    appt_time = str(row.get("appointment_time","")).strip()
+    signing_type = str(row.get("signing_type","")).strip()
+    location = str(row.get("location","")).strip()
+    fee = float(row.get("fee") or 0)
+    biz = settings.get("business_name","Your Notary")
+
+    body = (
+        f"Hi {row.get('client_name','')}, this is {biz} confirming your "
+        f"{signing_type} appointment for {appt_date} {appt_time}"
+    )
+    if location:
+        body += f" at {location}"
+    body += f". Fee: ${fee:,.2f}. Reply to confirm or call with questions."
+
+    sms_url = f"sms:{phone}?body={quote(body)}"
+    return sms_url, None
 
 def calculate_end_time(appointment_date, appointment_time, duration_minutes):
     start_dt = datetime.combine(appointment_date, appointment_time)
@@ -1627,6 +1655,28 @@ def create_pdf_invoice(row, settings):
     return buffer.getvalue(), None
 
 
+
+def auto_backup_to_supabase():
+    """Upload a SQLite backup snapshot to Supabase Storage (bucket: backups).
+    Called once per session. Returns (success, message).
+    """
+    if not using_supabase():
+        return False, "Supabase not connected"
+    if not os.path.exists(DB_NAME):
+        return False, "No local DB to back up"
+    try:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        with open(DB_NAME, "rb") as f:
+            db_bytes = f.read()
+        path = f"auto/{timestamp}_notary_assistant.db"
+        sb().storage.from_("backups").upload(
+            path, db_bytes,
+            {"content-type": "application/octet-stream", "x-upsert": "true"}
+        )
+        return True, f"Backup saved to Supabase Storage: {path}"
+    except Exception as e:
+        return False, str(e)
+
 def create_backup():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = os.path.join(BACKUP_FOLDER, f"notary_assistant_backup_{timestamp}.db")
@@ -1752,17 +1802,40 @@ settings = get_settings()
 
 st.set_page_config(page_title="Notary Digital Assistant", layout="centered")
 
+# ── Auto-backup to Supabase Storage (once per session) ───────────────────────
+if "auto_backup_done" not in st.session_state:
+    st.session_state.auto_backup_done = True
+    try:
+        _ok, _msg = auto_backup_to_supabase()
+    except Exception:
+        pass  # Never crash startup due to backup failure
+
 # ── Client Portal intercept ───────────────────────────────────────────────────
 # Must run before anything else renders. If ?portal= is in the URL,
 # show a locked-down client view and stop — never load the main app.
+PORTAL_TOKEN_DAYS = 7  # Portal links expire after this many days
+
+def _make_portal_token(client_id, day_bucket=None):
+    """Generate a token valid for the current 7-day window."""
+    import base64, hashlib, math
+    secret = st.secrets.get("SUPABASE_KEY", "notary")[:16]
+    if day_bucket is None:
+        day_bucket = math.floor(datetime.now().timestamp() / 86400 / PORTAL_TOKEN_DAYS)
+    payload = f"{client_id}:{secret}:{day_bucket}"
+    return base64.urlsafe_b64encode(
+        hashlib.sha256(payload.encode()).digest()[:12]
+    ).decode().rstrip("=")
+
+
 def _verify_portal_token(client_id, token):
-    import base64, hashlib
+    """Accept tokens from current or previous window (grace period)."""
+    import math
     try:
-        secret = st.secrets.get("SUPABASE_KEY", "notary")[:16]
-        expected = base64.urlsafe_b64encode(
-            hashlib.sha256(f"{client_id}:{secret}".encode()).digest()[:12]
-        ).decode().rstrip("=")
-        return token == expected
+        day_bucket = math.floor(datetime.now().timestamp() / 86400 / PORTAL_TOKEN_DAYS)
+        for bucket in [day_bucket, day_bucket - 1]:
+            if token == _make_portal_token(client_id, bucket):
+                return True
+        return False
     except Exception:
         return False
 
@@ -2096,8 +2169,8 @@ MENU_OPTIONS = [
 
 MENU_GROUPS = {
     "📊 Overview": ["Dashboard", "Calendar View"],
-    "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History", "Client Portal"],
-    "📅 Appointments": ["Add Appointment", "View Appointments", "Edit Appointment", "Delete Appointment", "Job Checklist", "Appointment Templates"],
+    "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History", "Client Portal", "Retention Report"],
+    "📅 Appointments": ["Add Appointment", "View Appointments", "Edit Appointment", "Delete Appointment", "Job Checklist", "Appointment Templates", "Recurring Scheduler"],
     "💰 Finance": ["Payment Tracking", "Invoice Status", "Invoice Generator", "Quote Generator", "Reports / Export", "Mileage / Tax Report"],
     "📬 Tools": ["Follow-Up Tracker", "Email Templates", "Map / Route Tools", "Document Attachments", "Referral Analytics", "Signing Day Sheet"],
     "⚙️ Admin": ["Admin / System Health", "Cloud Database Setup", "Settings / Business Profile", "Backup / Restore"],
@@ -2449,6 +2522,13 @@ st.sidebar.divider()
 if st.sidebar.button("🔄 Refresh", use_container_width=True, help="Pull latest data from Supabase"):
     clear_all_caches()
     st.rerun()
+
+# Offline / connection indicator
+if using_supabase():
+    st.sidebar.caption("☁️ Supabase connected")
+else:
+    st.sidebar.warning("⚠️ Offline — using local SQLite. Data may not persist.")
+
 st.sidebar.caption(f"Version {APP_VERSION}")
 
 if settings.get("logo_path") and os.path.exists(settings["logo_path"]):
@@ -2841,6 +2921,94 @@ elif menu == "Add Client":
                     st.success("Client saved successfully!")
 
 
+elif menu == "Retention Report":
+    st.header("Client Retention Report")
+    st.caption("See which clients come back, lifetime value, and average time between bookings.")
+
+    df_all = get_all_appointments_dataframe()
+    if df_all.empty:
+        st.info("No appointment data yet.")
+    else:
+        df_all["appointment_date"] = pd.to_datetime(df_all["appointment_date"], errors="coerce")
+        df_all["fee"] = pd.to_numeric(df_all["fee"], errors="coerce").fillna(0)
+
+        client_stats = df_all.groupby("client_name").agg(
+            total_appointments=("id", "count"),
+            first_appointment=("appointment_date", "min"),
+            last_appointment=("appointment_date", "max"),
+            lifetime_value=("fee", "sum"),
+        ).reset_index()
+
+        client_stats["days_as_client"] = (
+            client_stats["last_appointment"] - client_stats["first_appointment"]
+        ).dt.days
+
+        client_stats["avg_days_between"] = (
+            client_stats["days_as_client"] / (client_stats["total_appointments"] - 1)
+        ).where(client_stats["total_appointments"] > 1).fillna(0).round(0).astype(int)
+
+        client_stats["returning"] = client_stats["total_appointments"] > 1
+
+        one_time = len(client_stats[~client_stats["returning"]])
+        returning = len(client_stats[client_stats["returning"]])
+        retention_rate = returning / len(client_stats) * 100 if len(client_stats) > 0 else 0
+
+        is_dark_ret = dark_mode
+        cb = "#1e293b" if is_dark_ret else "#f8fafc"
+        cborder = "#334155" if is_dark_ret else "#e2e8f0"
+        clabel = "#94a3b8" if is_dark_ret else "#64748b"
+        cval = "#f1f5f9" if is_dark_ret else "#0f172a"
+
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.5rem;margin-bottom:1rem;">
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Total Clients</div>
+                <div style="font-size:1.3rem;font-weight:700;color:{cval};">{len(client_stats)}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Returning</div>
+                <div style="font-size:1.3rem;font-weight:700;color:#22c55e;">{returning}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">One-Time</div>
+                <div style="font-size:1.3rem;font-weight:700;color:#f59e0b;">{one_time}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Retention Rate</div>
+                <div style="font-size:1.3rem;font-weight:700;color:{cval};">{retention_rate:.0f}%</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.subheader("Top Clients by Lifetime Value")
+        top_clients = client_stats.sort_values("lifetime_value", ascending=False).head(10)
+        st.bar_chart(top_clients.set_index("client_name")["lifetime_value"])
+
+        st.subheader("All Client Stats")
+        display_stats = client_stats.copy()
+        display_stats["first_appointment"] = display_stats["first_appointment"].dt.strftime("%Y-%m-%d")
+        display_stats["last_appointment"] = display_stats["last_appointment"].dt.strftime("%Y-%m-%d")
+        display_stats["returning"] = display_stats["returning"].map({True: "✅ Yes", False: "⬜ No"})
+        display_stats["lifetime_value"] = display_stats["lifetime_value"].map("${:,.2f}".format)
+        display_stats["avg_days_between"] = display_stats["avg_days_between"].map(
+            lambda x: f"{x} days" if x > 0 else "—"
+        )
+        display_stats.columns = [
+            "Client", "Appointments", "First Visit", "Last Visit",
+            "Lifetime Value", "Days as Client", "Avg Days Between", "Returning"
+        ]
+        st.dataframe(display_stats[["Client","Appointments","First Visit","Last Visit",
+                                     "Lifetime Value","Avg Days Between","Returning"]],
+                     use_container_width=True, hide_index=True)
+
+        st.download_button(
+            "⬇️ Download Retention Report CSV",
+            data=display_stats.to_csv(index=False).encode("utf-8"),
+            file_name="client_retention_report.csv",
+            mime="text/csv"
+        )
+
+
 elif menu == "Client Portal":
     st.header("Client Portal Links")
     st.caption("Share a read-only link with a client showing their appointment history and balance.")
@@ -2854,18 +3022,14 @@ elif menu == "Client Portal":
         client_id = client_names[selected]
 
         # Generate a simple token — base64 of client_id + secret
-        import base64, hashlib
-        secret = st.secrets.get("SUPABASE_KEY", "notary")[:16]
-        token = base64.urlsafe_b64encode(
-            hashlib.sha256(f"{client_id}:{secret}".encode()).digest()[:12]
-        ).decode().rstrip("=")
+        token = _make_portal_token(str(client_id))
 
         app_url = st.secrets.get("APP_URL", "https://your-app.streamlit.app")
         portal_url = f"{app_url}?portal={client_id}&token={token}"
 
         st.subheader("Portal Link")
         st.code(portal_url)
-        st.caption("Send this link to your client. It shows their appointments and balance — no login required.")
+        st.caption(f"Send this link to your client. It shows their appointments and balance — no login required. Link expires in {PORTAL_TOKEN_DAYS} days.")
 
         # Copy button via markdown
         st.markdown(f"[📋 Open Portal Preview]({portal_url})")
@@ -3165,6 +3329,75 @@ elif menu == "Add Appointment":
                 )
                 st.success(f"Template '{tmpl_name_input}' saved!")
                 st.rerun()
+
+
+elif menu == "Recurring Scheduler":
+    st.header("Recurring Appointment Scheduler")
+    st.caption("Create multiple appointments at regular intervals for repeat clients — title companies, law firms, etc.")
+
+    clients = get_clients()
+    if not clients:
+        st.info("Add a client first.")
+    else:
+        with st.form("recurring_form"):
+            client_choices = {f"{c[1]} — {c[3] or 'No email'}": c[0] for c in clients}
+            selected_client_label = st.selectbox("Client", list(client_choices.keys()))
+            client_id = client_choices[selected_client_label]
+            client_obj = next(c for c in clients if c[0] == client_id)
+
+            signing_type = st.selectbox("Signing Type", SIGNING_TYPES)
+            location = st.text_input("Location", value=client_obj[4] or "")
+
+            _type_fees = get_signing_type_fees(settings)
+            fee = st.number_input("Fee per Appointment", min_value=0.0, step=5.0,
+                value=float(_type_fees.get(signing_type, settings.get("default_fee") or 0)))
+            mileage = st.number_input("Mileage per Appointment", min_value=0.0, step=1.0)
+            duration = st.number_input("Duration (minutes)", min_value=15, max_value=480, value=60, step=15)
+
+            start_date = st.date_input("First Appointment Date", value=date.today() + timedelta(days=1))
+            appt_time = st.time_input("Appointment Time", value=time(10, 0))
+            recurrence = st.selectbox("Repeat Every", ["Weekly", "Biweekly (every 2 weeks)", "Monthly", "Custom (days)"])
+            custom_days = st.number_input("Custom interval (days)", min_value=1, value=14,
+                help="Only used if 'Custom' is selected above") if "Custom" in recurrence else None
+            num_appointments = st.number_input("Number of Appointments to Create", min_value=2, max_value=52, value=4, step=1)
+            notes = st.text_area("Notes (applied to all)")
+
+            submitted = st.form_submit_button("📅 Create Recurring Appointments", type="primary")
+
+        if submitted:
+            interval_map = {
+                "Weekly": 7,
+                "Biweekly (every 2 weeks)": 14,
+                "Monthly": 30,
+            }
+            interval_days = int(custom_days or 0) if "Custom" in recurrence else interval_map.get(recurrence, 7)
+
+            created = []
+            current_date = start_date
+            time_str = appt_time.strftime("%H:%M")
+            end_time = calculate_end_time(current_date, appt_time, duration)
+
+            for i in range(int(num_appointments)):
+                appt_id = add_appointment(
+                    client_id, client_obj[1], client_obj[2], client_obj[3],
+                    str(current_date), time_str, duration, end_time,
+                    signing_type, location, fee, mileage, "Scheduled", notes
+                )
+                created.append((current_date, appt_id))
+                if recurrence == "Monthly":
+                    # Advance by one calendar month
+                    month = current_date.month + 1
+                    year = current_date.year + (month - 1) // 12
+                    month = ((month - 1) % 12) + 1
+                    import calendar as _cal
+                    day = min(current_date.day, _cal.monthrange(year, month)[1])
+                    current_date = current_date.replace(year=year, month=month, day=day)
+                else:
+                    current_date = current_date + timedelta(days=interval_days)
+
+            st.success(f"✅ Created {len(created)} appointments!")
+            for appt_date_val, appt_id in created:
+                st.write(f"• {appt_date_val.strftime('%A, %B %d, %Y')} — ID {appt_id}")
 
 
 elif menu == "View Appointments":
@@ -3534,9 +3767,41 @@ elif menu == "Payment Tracking":
 
             submitted = st.form_submit_button("Save Payment")
 
+            send_receipt = st.checkbox("Send payment receipt to client", value=bool(row.get("client_email")))
+
             if submitted:
                 add_payment(appointment_id, str(payment_date), amount_paid, payment_method, payment_notes)
                 st.success("Payment saved.")
+
+                if send_receipt and row.get("client_email"):
+                    total_paid_now = get_payment_total_for_appointment(appointment_id)
+                    remaining = max(float(row.get("fee") or 0) - total_paid_now, 0)
+                    receipt_body = (
+                        f"Hi {row.get('client_name','')},\n\n"
+                        f"Thank you — we've received your payment of ${float(amount_paid):,.2f} "
+                        f"on {payment_date} via {payment_method}.\n\n"
+                        f"Appointment: {row.get('signing_type','')} on {row.get('appointment_date','')}\n"
+                        f"Total Fee:   ${float(row.get('fee') or 0):,.2f}\n"
+                        f"Amount Paid: ${float(amount_paid):,.2f}\n"
+                        f"Total Paid:  ${total_paid_now:,.2f}\n"
+                        f"Balance Due: ${remaining:,.2f}\n\n"
+                        f"{'Your account is now paid in full. Thank you!' if remaining == 0 else 'Please contact us if you have questions about your balance.'}\n\n"
+                        f"— {settings.get('business_name','Your Notary')}\n"
+                        f"{settings.get('business_phone','')}\n"
+                        f"{settings.get('business_email','')}"
+                    )
+                    with st.spinner("Sending receipt..."):
+                        ok, err = send_email(
+                            row["client_email"],
+                            f"Payment Receipt — {settings.get('business_name','')}",
+                            receipt_body,
+                            settings=settings
+                        )
+                    if ok:
+                        st.success(f"Receipt sent to {row['client_email']} ✅")
+                    else:
+                        st.warning(f"Payment saved but receipt failed: {err}")
+
                 st.rerun()
 
         st.divider()
@@ -3867,6 +4132,115 @@ elif menu == "Mileage / Tax Report":
             mime="text/csv"
         )
 
+        # ── Schedule C / Tax Summary Export ──────────────────────────────
+        st.divider()
+        st.subheader("📊 Tax Summary Export (Schedule C)")
+
+        tax_year = st.selectbox("Tax Year",
+            sorted(df["appointment_date"].dt.year.dropna().unique().astype(int), reverse=True),
+            key="tax_year_select"
+        )
+        tax_df = df[df["appointment_date"].dt.year == tax_year].copy()
+        tax_df["fee"] = pd.to_numeric(tax_df["fee"], errors="coerce").fillna(0)
+
+        all_paid_tax = get_all_payment_totals()
+        tax_df["paid"] = tax_df["id"].apply(lambda x: all_paid_tax.get(int(x), 0.0))
+        tax_df["quarter"] = tax_df["appointment_date"].dt.to_period("Q").astype(str)
+
+        quarterly_tax = tax_df.groupby("quarter").agg(
+            appointments=("id","count"),
+            gross_income=("fee","sum"),
+            collected=("paid","sum"),
+            miles=("mileage","sum")
+        ).reset_index()
+        quarterly_tax["mileage_deduction"] = quarterly_tax["miles"] * mileage_rate
+        quarterly_tax["net_income"] = quarterly_tax["gross_income"] - quarterly_tax["mileage_deduction"]
+
+        annual_income = tax_df["fee"].sum()
+        annual_collected = tax_df["paid"].sum()
+        annual_miles = tax_df["mileage"].sum()
+        annual_deduction = annual_miles * mileage_rate
+        annual_net = annual_income - annual_deduction
+
+        # Summary metric cards
+        is_dark_tax = dark_mode
+        cb = "#1e293b" if is_dark_tax else "#f8fafc"
+        cborder = "#334155" if is_dark_tax else "#e2e8f0"
+        clabel = "#94a3b8" if is_dark_tax else "#64748b"
+        cval = "#f1f5f9" if is_dark_tax else "#0f172a"
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.5rem;margin:0.5rem 0;">
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Gross Income</div>
+                <div style="font-size:1.2rem;font-weight:700;color:{cval};">${annual_income:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Collected</div>
+                <div style="font-size:1.2rem;font-weight:700;color:#22c55e;">${annual_collected:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Miles Driven</div>
+                <div style="font-size:1.2rem;font-weight:700;color:{cval};">{annual_miles:,.1f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Mileage Deduction</div>
+                <div style="font-size:1.2rem;font-weight:700;color:#f59e0b;">${annual_deduction:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};font-weight:500;">Est. Net Income</div>
+                <div style="font-size:1.2rem;font-weight:700;color:{cval};">${annual_net:,.2f}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.dataframe(quarterly_tax.rename(columns={
+            "quarter": "Quarter", "appointments": "Jobs",
+            "gross_income": "Gross ($)", "collected": "Collected ($)",
+            "miles": "Miles", "mileage_deduction": "Mileage Deduction ($)",
+            "net_income": "Est. Net ($)"
+        }), use_container_width=True, hide_index=True)
+
+        # Downloadable tax report
+        tax_lines = [
+            f"SCHEDULE C TAX SUMMARY — {tax_year}",
+            f"{settings.get('business_name','')}",
+            f"Prepared: {date.today()}",
+            "=" * 50,
+            f"Gross Income (billed):    ${annual_income:>10,.2f}",
+            f"Total Collected:          ${annual_collected:>10,.2f}",
+            f"Total Miles Driven:       {annual_miles:>10,.1f} mi",
+            f"Mileage Rate:             ${mileage_rate:>10.3f}/mi",
+            f"Mileage Deduction:        ${annual_deduction:>10,.2f}",
+            f"Est. Net Income:          ${annual_net:>10,.2f}",
+            "",
+            "QUARTERLY BREAKDOWN",
+            "-" * 50,
+        ]
+        for _, qrow in quarterly_tax.iterrows():
+            tax_lines.append(
+                f"{qrow['quarter']}  Jobs: {int(qrow['appointments']):>3}  "
+                f"Gross: ${float(qrow['gross_income']):>8,.2f}  "
+                f"Miles: {float(qrow['miles']):>7,.1f}  "
+                f"Deduction: ${float(qrow['mileage_deduction']):>8,.2f}"
+            )
+        tax_lines += [
+            "",
+            "APPOINTMENT DETAIL",
+            "-" * 50,
+        ]
+        for _, ar in tax_df.sort_values("appointment_date").iterrows():
+            tax_lines.append(
+                f"{str(ar['appointment_date'])[:10]}  {str(ar['client_name']):<25}  "
+                f"{str(ar['signing_type']):<20}  ${float(ar['fee']):>8,.2f}  {float(ar['mileage']):>5,.1f} mi"
+            )
+
+        st.download_button(
+            "⬇️ Download Tax Summary (.txt)",
+            data="\n".join(tax_lines),
+            file_name=f"tax_summary_{tax_year}.txt",
+            mime="text/plain"
+        )
+
 
 elif menu == "Invoice Generator":
     st.header("Invoice Generator")
@@ -3993,6 +4367,16 @@ elif menu == "Email Templates":
             st.warning("This appointment does not have a client email address — cannot send.")
         else:
             st.info("Fix the blocking issues above before sending.")
+
+        # SMS confirmation link
+        st.divider()
+        st.subheader("📱 SMS Confirmation")
+        sms_url, sms_err = get_sms_link(row, settings)
+        if sms_url:
+            st.markdown(f"[📱 Send Confirmation Text]({sms_url})")
+            st.caption("Opens your phone's Messages app pre-filled with the appointment details.")
+        else:
+            st.caption(f"SMS unavailable: {sms_err}")
 
 
 elif menu == "Map / Route Tools":
@@ -4235,6 +4619,24 @@ alter table templates disable row level security;
     st.subheader("Connection Status")
     st.write(f"**Mode:** {'☁️ Supabase (cloud)' if using_supabase() else '💾 SQLite (local)'}")
     st.write(f"**SQLite path:** `{DB_NAME}`")
+
+    if using_supabase():
+        st.subheader("Supabase Storage")
+        try:
+            buckets = sb().storage.list_buckets()
+            bucket_names = [b.name for b in buckets]
+            if "attachments" in bucket_names:
+                st.success("✅ 'attachments' storage bucket — file uploads persist.")
+            else:
+                st.error("❌ 'attachments' bucket missing → Supabase → Storage → New bucket → 'attachments' → Public.")
+
+            if "backups" in bucket_names:
+                st.success("✅ 'backups' storage bucket — auto-backups active.")
+            else:
+                st.warning("⚠️ 'backups' bucket missing → Supabase → Storage → New bucket → 'backups' → Private. Auto-backup will be enabled once created.")
+        except Exception as e:
+            st.warning(f"Could not check storage buckets: {e}")
+
     st.warning("Never commit your Supabase secret key to GitHub. Keep it in Streamlit Secrets only.")
 
 
@@ -4276,6 +4678,28 @@ elif menu == "Settings / Business Profile":
         notification_email = st.text_input("Daily Digest Send To", value=settings.get("notification_email") or "",
             help="Where to send the daily appointment digest — usually your own email")
         st.caption("For Gmail: enable 2FA → Google Account → Security → App Passwords → generate one for 'Mail'")
+
+        if st.form_submit_button("📧 Send Test Email", type="secondary"):
+            if not smtp_host or not smtp_user or not smtp_password:
+                st.warning("Fill in SMTP Host, Username, and Password first, then save and test.")
+            else:
+                test_settings = {
+                    "smtp_host": smtp_host, "smtp_port": smtp_port,
+                    "smtp_user": smtp_user, "smtp_password": smtp_password,
+                    "smtp_from_name": smtp_from_name or "Notary Assistant",
+                    "business_name": business_name,
+                }
+                with st.spinner("Sending test email..."):
+                    ok, err = send_email(
+                        smtp_user,
+                        "✅ Notary Assistant — SMTP Test",
+                        f"Your SMTP settings are working correctly!\n\nApp: {settings.get('business_name','')}\nHost: {smtp_host}:{smtp_port}",
+                        settings=test_settings
+                    )
+                if ok:
+                    st.success(f"Test email sent to {smtp_user} ✅")
+                else:
+                    st.error(f"Failed: {err}")
 
         st.subheader("🔐 Security")
         auth_enabled = st.checkbox("Enable Simple Login", value=bool(settings.get("auth_enabled")))
