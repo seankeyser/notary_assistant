@@ -19,13 +19,14 @@ _SAFE_EXPORT_TABLES = frozenset(
 
 # ── Supabase connection ───────────────────────────────────────────────────────
 def _get_supabase():
-    """Return a Supabase client if credentials are available, else None.
-    Credentials come from Streamlit Secrets (preferred) or session state settings.
-    """
+    """Return a Supabase client if credentials are available, else None."""
     try:
         from supabase import create_client
-        url = st.secrets.get("SUPABASE_URL", "")
-        key = st.secrets.get("SUPABASE_KEY", "")
+        try:
+            url = st.secrets.get("SUPABASE_URL", "")
+            key = st.secrets.get("SUPABASE_KEY", "")
+        except Exception:
+            return None
         if url and key:
             return create_client(url, key)
     except Exception:
@@ -33,10 +34,14 @@ def _get_supabase():
     return None
 
 
-@st.cache_resource
-def _supabase_client():
-    """Cached Supabase client — created once per session."""
-    return _get_supabase()
+try:
+    @st.cache_resource
+    def _supabase_client():
+        """Cached Supabase client — created once per session."""
+        return _get_supabase()
+except Exception:
+    def _supabase_client():
+        return None
 
 
 def using_supabase():
@@ -378,6 +383,15 @@ def migrate_sqlite_to_supabase():
         return False, f"Migration error: {e}"
 
 
+@st.cache_data(ttl=60)
+def get_settings():
+    if using_supabase():
+        try:
+            resp = sb().table("settings").select("*").eq("id", 1).execute()
+            if resp.data:
+                return resp.data[0]
+        except Exception:
+            pass
     with db_conn() as conn:
         row = pd.read_sql_query("SELECT * FROM settings WHERE id = 1", conn)
     if row.empty:
