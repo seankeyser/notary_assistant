@@ -1261,15 +1261,26 @@ st.set_page_config(page_title="Notary Digital Assistant", layout="centered")
 # ── Responsive / mobile CSS ───────────────────────────────────────────────────
 st.markdown("""
 <style>
-/* ── Make the main content area use full width on all screens ── */
+/* ── Base: full-width content area on all screens ── */
 .block-container {
     max-width: 100% !important;
     padding-left: 1rem !important;
     padding-right: 1rem !important;
-    padding-top: 1rem !important;
+    padding-top: 0.75rem !important;
 }
 
-/* ── All buttons: large touch targets ── */
+/* ── Disable Android Chrome text inflation which breaks flex layouts ── */
+* {
+    -webkit-text-size-adjust: 100% !important;
+    text-size-adjust: 100% !important;
+}
+
+/* ── Consistent box sizing everywhere ── */
+*, *::before, *::after {
+    box-sizing: border-box !important;
+}
+
+/* ── Touch-friendly tap targets ── */
 .stButton > button,
 [data-testid="baseButton-secondary"],
 [data-testid="baseButton-primary"],
@@ -1278,7 +1289,7 @@ st.markdown("""
     font-size: 0.95rem !important;
 }
 
-/* ── Inputs & selects: comfortable touch size ── */
+/* ── Input fields: comfortable touch size ── */
 .stTextInput > div > div > input,
 .stNumberInput > div > div > input,
 .stTextArea > div > div > textarea,
@@ -1289,115 +1300,132 @@ st.markdown("""
     font-size: 1rem !important;
 }
 
-/* ── Metric cards: slightly larger text on small screens ── */
+/* ── Metric cards: tighten spacing ── */
+[data-testid="metric-container"] {
+    padding: 0.5rem 0.6rem !important;
+    margin-bottom: 0.25rem !important;
+}
 [data-testid="stMetricValue"] {
-    font-size: 1.4rem !important;
+    font-size: 1.3rem !important;
+    line-height: 1.2 !important;
+}
+[data-testid="stMetricLabel"] {
+    font-size: 0.78rem !important;
+    line-height: 1.2 !important;
 }
 
-/* ── ════════════════════════════════════════════════════════
-   TABLET  (≤ 900px) — collapse 4-5 col grids to 2 col
+/* ══════════════════════════════════════════════════════════
+   TABLET  (≤ 1024px) — 5-col becomes 3-col
    ══════════════════════════════════════════════════════════ */
-@media (max-width: 900px) {
-    /* Force Streamlit columns to wrap at 50% */
+@media (max-width: 1024px) {
     [data-testid="stHorizontalBlock"] {
         flex-wrap: wrap !important;
+        gap: 0.4rem !important;
     }
     [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-        min-width: 45% !important;
-        flex: 1 1 45% !important;
+        min-width: 30% !important;
+        flex: 1 1 30% !important;
     }
-    /* Tighten page padding */
-    .block-container {
-        padding-left: 0.75rem !important;
-        padding-right: 0.75rem !important;
-    }
-    /* Smaller header on tablets */
-    h1 { font-size: 1.6rem !important; }
-    h2 { font-size: 1.3rem !important; }
-    h3 { font-size: 1.1rem !important; }
+    h1 { font-size: 1.5rem !important; }
+    h2 { font-size: 1.25rem !important; }
 }
 
-/* ── ════════════════════════════════════════════════════════
-   MOBILE  (≤ 640px) — single column layout throughout
+/* ══════════════════════════════════════════════════════════
+   PHONE  (≤ 640px) — 2-column grid for metrics & buttons
+   Pixel 9 Pro XL logical viewport = 412px
    ══════════════════════════════════════════════════════════ */
 @media (max-width: 640px) {
-    /* Stack every column to full width */
+    .block-container {
+        padding-left: 0.4rem !important;
+        padding-right: 0.4rem !important;
+    }
+
+    /* 2-column grid — sized for 412px viewport */
     [data-testid="stHorizontalBlock"] {
-        flex-direction: column !important;
         flex-wrap: wrap !important;
-        gap: 0.5rem !important;
+        gap: 0.3rem !important;
+        width: 100% !important;
     }
     [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
-        min-width: 100% !important;
-        width: 100% !important;
-        flex: 1 1 100% !important;
+        min-width: 0 !important;
+        flex: 1 1 calc(50% - 0.3rem) !important;
+        max-width: calc(50% - 0.3rem) !important;
+        overflow: hidden !important;
     }
-    /* Tighten padding even more */
-    .block-container {
-        padding-left: 0.5rem !important;
-        padding-right: 0.5rem !important;
+
+    /* Metric cards: compact 2-up grid */
+    [data-testid="metric-container"] {
+        padding: 0.4rem 0.5rem !important;
+        margin: 0 !important;
     }
-    /* Sidebar: full-width overlay on mobile — Streamlit handles this
-       but ensure content doesn't get crushed when sidebar is open */
+    [data-testid="stMetricValue"] {
+        font-size: 1.1rem !important;
+        line-height: 1.15 !important;
+    }
+    [data-testid="stMetricLabel"] {
+        font-size: 0.72rem !important;
+        line-height: 1.1 !important;
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+    }
+
+    /* Sidebar: sensible width on phone */
     section[data-testid="stSidebar"] {
-        min-width: 280px !important;
-        max-width: 85vw !important;
+        min-width: 260px !important;
+        max-width: 82vw !important;
     }
-    /* Smaller text hierarchy */
-    h1 { font-size: 1.4rem !important; }
-    h2 { font-size: 1.2rem !important; }
-    h3 { font-size: 1.05rem !important; }
-    p, label, span, div { font-size: 0.95rem !important; }
-    /* Metric values: tighter on phone */
-    [data-testid="stMetricValue"] { font-size: 1.2rem !important; }
-    [data-testid="stMetricLabel"] { font-size: 0.8rem !important; }
-    /* Dataframes: horizontal scroll on small screens */
+
+    h1 { font-size: 1.3rem !important; }
+    h2 { font-size: 1.15rem !important; }
+    h3 { font-size: 1.0rem !important; }
+
+    /* Dataframes: horizontal scroll */
     [data-testid="stDataFrame"] {
         overflow-x: auto !important;
         -webkit-overflow-scrolling: touch !important;
     }
-    /* Buttons: full width on mobile */
+
+    /* Buttons: full width when alone, 2-up in column grids */
     .stButton > button {
         width: 100% !important;
-        margin-bottom: 0.25rem !important;
     }
-    /* Expanders: more padding for finger tap */
-    [data-testid="stExpander"] summary {
-        padding: 0.75rem !important;
-        font-size: 1rem !important;
-    }
-    /* Download buttons full width */
-    [data-testid="stDownloadButton"] {
-        width: 100% !important;
-    }
+    [data-testid="stDownloadButton"],
     [data-testid="stDownloadButton"] > button {
         width: 100% !important;
     }
-    /* Text areas: shorter default on phone */
-    textarea {
-        min-height: 80px !important;
+
+    /* Expanders: larger tap area */
+    [data-testid="stExpander"] summary {
+        padding: 0.65rem 0.75rem !important;
+        font-size: 0.95rem !important;
     }
-    /* Progress bar label text */
-    [data-testid="stProgress"] {
-        font-size: 0.85rem !important;
-    }
-    /* Calendar/date popover — full width on mobile */
-    [data-testid="stDateInputPopover"] {
-        width: 95vw !important;
-        left: 2.5vw !important;
-    }
-    /* Sidebar nav buttons */
-    .stButton > button {
-        font-size: 0.9rem !important;
-        padding: 0.5rem 0.75rem !important;
-    }
-    /* Reduce image size on mobile */
+
+    /* Reduce logo size on phone */
     [data-testid="stImage"] img {
-        max-width: 160px !important;
+        max-width: 140px !important;
     }
+
+    /* Date picker popover stays in viewport */
+    [data-testid="stDateInputPopover"] {
+        width: 94vw !important;
+        left: 3vw !important;
+    }
+}
+
+/* ══════════════════════════════════════════════════════════
+   SMALL PHONE  (≤ 380px) — single column fallback
+   ══════════════════════════════════════════════════════════ */
+@media (max-width: 380px) {
+    [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+        min-width: 100% !important;
+        flex: 1 1 100% !important;
+    }
+    [data-testid="stMetricValue"] { font-size: 1rem !important; }
 }
 </style>
 """, unsafe_allow_html=True)
+
 
 
 if settings.get("auth_enabled") in [1, "1", True] and settings.get("app_password"):
@@ -1754,10 +1782,15 @@ if dark_mode:
             }
             [data-testid="stAlert"] {
                 border-radius: 6px !important;
-                padding: 0.6rem !important;
+                padding: 0.5rem 0.6rem !important;
             }
             [data-testid="stExpander"] {
-                margin-bottom: 0.5rem !important;
+                margin-bottom: 0.4rem !important;
+            }
+            /* Keep metric card dark on 2-col grid */
+            [data-testid="metric-container"] {
+                background-color: #1e293b !important;
+                border: 1px solid #334155 !important;
             }
         }
         </style>
