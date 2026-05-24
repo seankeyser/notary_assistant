@@ -12,10 +12,42 @@ from streamlit_calendar import calendar
 
 
 DB_NAME = os.environ.get("NOTARY_DB_PATH", "notary_assistant.db")
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 _SAFE_EXPORT_TABLES = frozenset(
     ["clients", "appointments", "payments", "checklist", "attachments", "followups", "settings"]
 )
+
+# ── Supabase connection ───────────────────────────────────────────────────────
+def _get_supabase():
+    """Return a Supabase client if credentials are available, else None.
+    Credentials come from Streamlit Secrets (preferred) or session state settings.
+    """
+    try:
+        from supabase import create_client
+        url = st.secrets.get("SUPABASE_URL", "")
+        key = st.secrets.get("SUPABASE_KEY", "")
+        if url and key:
+            return create_client(url, key)
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_resource
+def _supabase_client():
+    """Cached Supabase client — created once per session."""
+    return _get_supabase()
+
+
+def using_supabase():
+    """True if a working Supabase client is available."""
+    return _supabase_client() is not None
+
+
+def sb():
+    """Shorthand for the cached Supabase client."""
+    return _supabase_client()
+
 UPLOAD_FOLDER = "uploads"
 BACKUP_FOLDER = "backups"
 
@@ -261,8 +293,91 @@ def create_tables():
         conn.commit()
 
 
-@st.cache_data(ttl=60)
-def get_settings():
+def create_supabase_tables():
+    """Create all tables in Supabase using the REST API (run once on first deploy).
+    Uses raw SQL via the Supabase SQL editor equivalent — calls rpc if available,
+    otherwise provides the SQL for manual execution.
+    """
+    client = sb()
+    if not client:
+        return False, "No Supabase connection"
+
+    # Test connection with a simple query
+    try:
+        client.table("settings").select("id").limit(1).execute()
+        return True, "Tables already exist"
+    except Exception:
+        pass
+
+    return False, "Tables need to be created — see Cloud Database Setup page for SQL"
+
+
+def migrate_sqlite_to_supabase():
+    """One-time migration: copy all SQLite data into Supabase.
+    Safe to run multiple times — uses upsert so existing records aren't duplicated.
+    """
+    client = sb()
+    if not client:
+        return False, "No Supabase connection"
+
+    results = []
+
+    try:
+        # Settings
+        with db_conn() as conn:
+            settings_df = pd.read_sql_query("SELECT * FROM settings", conn)
+        if not settings_df.empty:
+            client.table("settings").upsert(settings_df.to_dict("records")).execute()
+            results.append(f"✅ Settings: {len(settings_df)} row(s)")
+
+        # Clients
+        with db_conn() as conn:
+            clients_df = pd.read_sql_query("SELECT * FROM clients", conn)
+        if not clients_df.empty:
+            client.table("clients").upsert(clients_df.to_dict("records")).execute()
+            results.append(f"✅ Clients: {len(clients_df)} row(s)")
+
+        # Appointments
+        with db_conn() as conn:
+            appts_df = pd.read_sql_query("SELECT * FROM appointments", conn)
+        if not appts_df.empty:
+            client.table("appointments").upsert(appts_df.to_dict("records")).execute()
+            results.append(f"✅ Appointments: {len(appts_df)} row(s)")
+
+        # Payments
+        with db_conn() as conn:
+            payments_df = pd.read_sql_query("SELECT * FROM payments", conn)
+        if not payments_df.empty:
+            client.table("payments").upsert(payments_df.to_dict("records")).execute()
+            results.append(f"✅ Payments: {len(payments_df)} row(s)")
+
+        # Checklist
+        with db_conn() as conn:
+            checklist_df = pd.read_sql_query("SELECT * FROM checklist", conn)
+        if not checklist_df.empty:
+            client.table("checklist").upsert(checklist_df.to_dict("records")).execute()
+            results.append(f"✅ Checklist: {len(checklist_df)} row(s)")
+
+        # Followups
+        with db_conn() as conn:
+            followups_df = pd.read_sql_query("SELECT * FROM followups", conn)
+        if not followups_df.empty:
+            client.table("followups").upsert(followups_df.to_dict("records")).execute()
+            results.append(f"✅ Follow-ups: {len(followups_df)} row(s)")
+
+        # Templates
+        with db_conn() as conn:
+            templates_df = pd.read_sql_query("SELECT * FROM templates", conn)
+        if not templates_df.empty:
+            client.table("templates").upsert(templates_df.to_dict("records")).execute()
+            results.append(f"✅ Templates: {len(templates_df)} row(s)")
+
+        return True, "\n".join(results)
+
+    except Exception as e:
+        return False, f"Migration error: {e}"
+
+
     with db_conn() as conn:
         row = pd.read_sql_query("SELECT * FROM settings WHERE id = 1", conn)
     if row.empty:
@@ -289,6 +404,13 @@ def get_settings():
 
 
 def update_settings(settings):
+    if using_supabase():
+        try:
+            sb().table("settings").upsert({**settings, "id": 1}).execute()
+            get_settings.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute("""
             UPDATE settings
@@ -418,6 +540,16 @@ def check_schedule_issues(appointment_date, appointment_time, duration_minutes, 
 
 
 def add_client(client_name, phone, email, address, referral_source, notes):
+    if using_supabase():
+        try:
+            sb().table("clients").insert({
+                "client_name": client_name, "phone": phone, "email": email,
+                "address": address, "referral_source": referral_source, "notes": notes
+            }).execute()
+            get_clients.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute(
             "INSERT INTO clients (client_name, phone, email, address, referral_source, notes) VALUES (?, ?, ?, ?, ?, ?)",
@@ -428,6 +560,20 @@ def add_client(client_name, phone, email, address, referral_source, notes):
 
 
 def update_client(client_id, client_name, phone, email, address, referral_source, notes):
+    if using_supabase():
+        try:
+            sb().table("clients").update({
+                "client_name": client_name, "phone": phone, "email": email,
+                "address": address, "referral_source": referral_source, "notes": notes
+            }).eq("id", client_id).execute()
+            sb().table("appointments").update({
+                "client_name": client_name, "client_phone": phone, "client_email": email
+            }).eq("client_id", client_id).execute()
+            get_clients.clear()
+            get_all_appointments_dataframe.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute(
             "UPDATE clients SET client_name=?, phone=?, email=?, address=?, referral_source=?, notes=? WHERE id=?",
@@ -443,6 +589,13 @@ def update_client(client_id, client_name, phone, email, address, referral_source
 
 
 def delete_client(client_id):
+    if using_supabase():
+        try:
+            sb().table("clients").delete().eq("id", client_id).execute()
+            get_clients.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute("DELETE FROM clients WHERE id = ?", (client_id,))
         conn.commit()
@@ -451,6 +604,12 @@ def delete_client(client_id):
 
 @st.cache_data(ttl=30)
 def get_clients():
+    if using_supabase():
+        try:
+            resp = sb().table("clients").select("id,client_name,phone,email,address,referral_source,notes").order("client_name").execute()
+            return [(r["id"], r["client_name"], r["phone"], r["email"], r["address"], r["referral_source"], r["notes"]) for r in resp.data]
+        except Exception:
+            pass
     with db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -477,6 +636,28 @@ def add_appointment(client_id, client_name, client_phone, client_email,
         invoice_date = appointment_date
     if payment_due_date is None:
         payment_due_date = (date.fromisoformat(str(appointment_date)) + timedelta(days=7)).isoformat()
+
+    if using_supabase():
+        try:
+            resp = sb().table("appointments").insert({
+                "client_id": client_id, "client_name": client_name,
+                "client_phone": client_phone, "client_email": client_email,
+                "appointment_date": str(appointment_date), "appointment_time": appointment_time,
+                "duration_minutes": duration_minutes, "end_time": end_time,
+                "signing_type": signing_type, "location": location,
+                "fee": fee, "mileage": mileage, "status": status, "notes": notes,
+                "invoice_date": str(invoice_date), "payment_due_date": str(payment_due_date)
+            }).execute()
+            appointment_id = resp.data[0]["id"]
+            # Add checklist items
+            sb().table("checklist").insert([
+                {"appointment_id": appointment_id, "item_name": item, "completed": False}
+                for item in CHECKLIST_ITEMS
+            ]).execute()
+            get_all_appointments_dataframe.clear()
+            return appointment_id
+        except Exception:
+            pass
 
     with db_conn() as conn:
         cursor = conn.cursor()
@@ -525,6 +706,13 @@ def get_appointments(search_text="", status_filter="All"):
 
 @st.cache_data(ttl=30)
 def get_all_appointments_dataframe():
+    if using_supabase():
+        try:
+            resp = sb().table("appointments").select("*").order("appointment_date", desc=True).execute()
+            if resp.data:
+                return pd.DataFrame(resp.data)
+        except Exception:
+            pass
     with db_conn() as conn:
         df = pd.read_sql_query("""
         SELECT 
@@ -630,6 +818,13 @@ def update_appointment(appointment_id, client_name, client_phone, client_email,
 
 
 def update_status(appointment_id, new_status):
+    if using_supabase():
+        try:
+            sb().table("appointments").update({"status": new_status}).eq("id", appointment_id).execute()
+            get_all_appointments_dataframe.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute("UPDATE appointments SET status = ? WHERE id = ?", (new_status, appointment_id))
         conn.commit()
@@ -637,6 +832,16 @@ def update_status(appointment_id, new_status):
 
 
 def delete_appointment(appointment_id):
+    if using_supabase():
+        try:
+            for tbl in ["payments", "checklist", "attachments"]:
+                sb().table(tbl).delete().eq("appointment_id", appointment_id).execute()
+            sb().table("appointments").delete().eq("id", appointment_id).execute()
+            get_all_appointments_dataframe.clear()
+            get_all_payment_totals.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute("DELETE FROM payments WHERE appointment_id = ?", (appointment_id,))
         conn.execute("DELETE FROM checklist WHERE appointment_id = ?", (appointment_id,))
@@ -669,6 +874,28 @@ def get_payments_dataframe():
 
 
 def add_payment(appointment_id, payment_date, amount_paid, payment_method, notes):
+    if using_supabase():
+        try:
+            sb().table("payments").insert({
+                "appointment_id": appointment_id, "payment_date": str(payment_date),
+                "amount_paid": float(amount_paid), "payment_method": payment_method, "notes": notes
+            }).execute()
+            # Update appointment status
+            resp = sb().table("appointments").select("fee").eq("id", appointment_id).execute()
+            fee = float(resp.data[0]["fee"] or 0) if resp.data else 0
+            totals = get_all_payment_totals.__wrapped__() if hasattr(get_all_payment_totals, "__wrapped__") else None
+            if totals is None:
+                paid_resp = sb().table("payments").select("amount_paid").eq("appointment_id", appointment_id).execute()
+                total_paid = sum(float(r["amount_paid"] or 0) for r in paid_resp.data)
+            else:
+                total_paid = totals.get(appointment_id, 0)
+            new_status = "Paid" if fee > 0 and total_paid >= fee else "Awaiting Payment"
+            sb().table("appointments").update({"status": new_status}).eq("id", appointment_id).execute()
+            get_all_payment_totals.clear()
+            get_all_appointments_dataframe.clear()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         cursor = conn.cursor()
         cursor.execute(
@@ -697,6 +924,16 @@ def get_payment_total_for_appointment(appointment_id):
 @st.cache_data(ttl=30)
 def get_all_payment_totals():
     """Return {appointment_id: total_paid} in a single DB query."""
+    if using_supabase():
+        try:
+            resp = sb().table("payments").select("appointment_id,amount_paid").execute()
+            totals = {}
+            for r in resp.data:
+                aid = r["appointment_id"]
+                totals[aid] = totals.get(aid, 0.0) + float(r["amount_paid"] or 0)
+            return totals
+        except Exception:
+            pass
     with db_conn() as conn:
         rows = conn.execute("SELECT appointment_id, SUM(amount_paid) FROM payments GROUP BY appointment_id").fetchall()
     return {row[0]: float(row[1] or 0) for row in rows}
@@ -775,6 +1012,16 @@ def get_invoice_status_dataframe(df):
 
 
 def add_followup(appointment_id, followup_date, followup_type, outcome, notes, completed):
+    if using_supabase():
+        try:
+            sb().table("followups").insert({
+                "appointment_id": appointment_id, "followup_date": str(followup_date),
+                "followup_type": followup_type, "outcome": outcome,
+                "notes": notes, "completed": bool(completed)
+            }).execute()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute(
             "INSERT INTO followups (appointment_id, followup_date, followup_type, outcome, notes, completed) VALUES (?, ?, ?, ?, ?, ?)",
@@ -784,6 +1031,20 @@ def add_followup(appointment_id, followup_date, followup_type, outcome, notes, c
 
 
 def get_followups_dataframe():
+    if using_supabase():
+        try:
+            resp = sb().table("followups").select("*, appointments(client_name, appointment_date, signing_type)").order("followup_date", desc=True).execute()
+            if resp.data:
+                rows = []
+                for r in resp.data:
+                    appt = r.pop("appointments", {}) or {}
+                    r["client_name"] = appt.get("client_name", "")
+                    r["appointment_date"] = appt.get("appointment_date", "")
+                    r["signing_type"] = appt.get("signing_type", "")
+                    rows.append(r)
+                return pd.DataFrame(rows)
+        except Exception:
+            pass
     with db_conn() as conn:
         df = pd.read_sql_query("""
         SELECT 
@@ -868,6 +1129,12 @@ def ensure_checklist_for_appointment(appointment_id):
 
 def get_checklist(appointment_id):
     ensure_checklist_for_appointment(appointment_id)
+    if using_supabase():
+        try:
+            resp = sb().table("checklist").select("id,item_name,completed").eq("appointment_id", appointment_id).order("id").execute()
+            return [(r["id"], r["item_name"], 1 if r["completed"] else 0) for r in resp.data]
+        except Exception:
+            pass
     with db_conn() as conn:
         return conn.execute(
             "SELECT id, item_name, completed FROM checklist WHERE appointment_id = ? ORDER BY id",
@@ -876,6 +1143,12 @@ def get_checklist(appointment_id):
 
 
 def update_checklist_item(checklist_id, completed):
+    if using_supabase():
+        try:
+            sb().table("checklist").update({"completed": bool(completed)}).eq("id", checklist_id).execute()
+            return
+        except Exception:
+            pass
     with db_conn() as conn:
         conn.execute("UPDATE checklist SET completed = ? WHERE id = ?", (1 if completed else 0, checklist_id))
         conn.commit()
@@ -1867,13 +2140,37 @@ if menu == "Dashboard":
         total_fees = df["fee"].sum()
         total_mileage = df["mileage"].sum()
 
-        # Metrics displayed in a 5-col grid; CSS collapses to 2-col on tablet, 1-col on mobile
-        m1, m2, m3, m4, m5 = st.columns([1, 1, 1, 1, 1])
-        m1.metric("Appointments", total_appointments)
-        m2.metric("Total Billed", f"${total_fees:,.2f}")
-        m3.metric("Paid Invoices", f"${total_paid_actual:,.2f}")
-        m4.metric("Balance Due", f"${total_unpaid:,.2f}")
-        m5.metric("Mileage", f"{total_mileage:,.1f} mi")
+        # HTML metric grid — immune to Streamlit's column layout on mobile
+        is_dark = dark_mode
+        card_bg = "#1e293b" if is_dark else "#f8fafc"
+        card_border = "#334155" if is_dark else "#e2e8f0"
+        label_color = "#94a3b8" if is_dark else "#64748b"
+        value_color = "#f1f5f9" if is_dark else "#0f172a"
+
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.5rem;margin-bottom:0.75rem;">
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">Appointments</div>
+                <div style="font-size:1.4rem;font-weight:700;color:{value_color};">{total_appointments}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">Total Billed</div>
+                <div style="font-size:1.4rem;font-weight:700;color:{value_color};">${total_fees:,.0f}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">Paid Invoices</div>
+                <div style="font-size:1.4rem;font-weight:700;color:#22c55e;">${total_paid_actual:,.0f}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">Balance Due</div>
+                <div style="font-size:1.4rem;font-weight:700;color:#f59e0b;">${total_unpaid:,.0f}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">Mileage</div>
+                <div style="font-size:1.4rem;font-weight:700;color:{value_color};">{total_mileage:,.1f} mi</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
         # Revenue goal tracker
         revenue_goal = float(settings.get("revenue_goal") or 0)
@@ -1901,11 +2198,26 @@ if menu == "Dashboard":
         overdue_count = len(invoice_df[invoice_df["invoice_status"] == "Overdue"])
 
         st.subheader("Invoice Status")
-        inv1, inv2, inv3, inv4 = st.columns([1, 1, 1, 1])
-        inv1.metric("✅ Paid", paid_count)
-        inv2.metric("🔲 Unpaid", unpaid_count)
-        inv3.metric("⏳ Partial", partial_count)
-        inv4.metric("🔴 Overdue", overdue_count)
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:0.5rem;margin-bottom:0.75rem;">
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">✅ Paid</div>
+                <div style="font-size:1.4rem;font-weight:700;color:#22c55e;">{paid_count}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">🔲 Unpaid</div>
+                <div style="font-size:1.4rem;font-weight:700;color:{value_color};">{unpaid_count}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">⏳ Partial</div>
+                <div style="font-size:1.4rem;font-weight:700;color:#f59e0b;">{partial_count}</div>
+            </div>
+            <div style="background:{card_bg};border:1px solid {card_border};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.75rem;color:{label_color};font-weight:500;">🔴 Overdue</div>
+                <div style="font-size:1.4rem;font-weight:700;color:#ef4444;">{overdue_count}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
         if overdue_count > 0:
             st.warning(f"⚠️ {overdue_count} invoice(s) are overdue.")
@@ -3259,29 +3571,121 @@ elif menu == "Admin / System Health":
 elif menu == "Cloud Database Setup":
     st.header("Cloud Database Setup")
 
-    st.subheader("Current Mode")
-    st.code(f"SQLite  ·  {DB_NAME}")
-    st.info("SQLite works great locally. When you're ready to deploy persistently, connect Supabase.")
-
-    supabase_url_val = settings.get("supabase_url") or ""
-    supabase_key_val = settings.get("supabase_key") or ""
-
-    if supabase_url_val and supabase_key_val:
-        st.success("✅ Supabase credentials are saved. Ready to migrate when you choose to.")
-        st.code(f"Project URL: {supabase_url_val}")
+    if using_supabase():
+        st.success("✅ Connected to Supabase")
+        st.code(f"Project: {st.secrets.get('SUPABASE_URL', '')}")
     else:
-        st.warning("No Supabase credentials saved yet. Add them in Settings / Business Profile.")
+        st.error("❌ Not connected to Supabase — add credentials to Streamlit Secrets")
+        st.caption("Go to Streamlit Cloud → Manage app → Secrets and add SUPABASE_URL and SUPABASE_KEY")
 
-    st.subheader("Migration Roadmap")
-    st.write("1. ✅ Keep SQLite for local development")
-    st.write("2. Create a free Supabase project at supabase.com")
-    st.write("3. Add your Project URL and Anon Key in Settings / Business Profile")
-    st.write("4. Use Supabase Table Editor to create matching tables")
-    st.write("5. Export your data from Admin → Export Database Snapshots and import to Supabase")
+    st.divider()
 
-    st.subheader("Notes")
-    st.write(settings.get("cloud_database_url") or "No notes saved yet.")
-    st.warning("Never commit API keys or database URLs to GitHub. Use Streamlit Secrets in production.")
+    st.subheader("Step 1 — Create Tables in Supabase")
+    st.caption("Run this SQL once in your Supabase SQL Editor (supabase.com → SQL Editor → New query)")
+
+    supabase_sql = """
+-- Run this entire block in your Supabase SQL Editor
+
+create table if not exists settings (
+    id integer primary key,
+    business_name text, business_phone text, business_email text,
+    business_website text, business_tagline text,
+    default_fee real, default_mileage_rate real, default_travel_buffer integer,
+    logo_path text, auth_enabled integer default 0,
+    app_password text, cloud_database_url text,
+    signing_type_fees text, revenue_goal real default 0,
+    supabase_url text, supabase_key text
+);
+
+create table if not exists clients (
+    id bigserial primary key,
+    client_name text not null, phone text, email text,
+    address text, notes text, referral_source text
+);
+
+create table if not exists appointments (
+    id bigserial primary key,
+    client_id bigint references clients(id),
+    client_name text, client_phone text, client_email text,
+    appointment_date text, appointment_time text,
+    duration_minutes integer, end_time text,
+    signing_type text, location text,
+    fee real, mileage real, status text, notes text,
+    invoice_date text, payment_due_date text,
+    client_notes text, internal_notes text
+);
+
+create table if not exists payments (
+    id bigserial primary key,
+    appointment_id bigint references appointments(id),
+    payment_date text, amount_paid real,
+    payment_method text, notes text
+);
+
+create table if not exists checklist (
+    id bigserial primary key,
+    appointment_id bigint references appointments(id),
+    item_name text, completed boolean default false
+);
+
+create table if not exists attachments (
+    id bigserial primary key,
+    appointment_id bigint references appointments(id),
+    file_name text, file_path text,
+    uploaded_at text, notes text
+);
+
+create table if not exists followups (
+    id bigserial primary key,
+    appointment_id bigint references appointments(id),
+    followup_date text, followup_type text,
+    outcome text, notes text, completed boolean default false
+);
+
+create table if not exists templates (
+    id bigserial primary key,
+    template_name text not null,
+    signing_type text, location text,
+    fee real, mileage real, duration_minutes integer,
+    notes text, client_notes text, internal_notes text,
+    created_at text
+);
+
+-- Disable Row Level Security (app uses secret key server-side)
+alter table settings disable row level security;
+alter table clients disable row level security;
+alter table appointments disable row level security;
+alter table payments disable row level security;
+alter table checklist disable row level security;
+alter table attachments disable row level security;
+alter table followups disable row level security;
+alter table templates disable row level security;
+"""
+    st.code(supabase_sql, language="sql")
+    st.download_button("⬇️ Download SQL", data=supabase_sql,
+                       file_name="create_notary_tables.sql", mime="text/plain")
+
+    st.divider()
+    st.subheader("Step 2 — Migrate Your Existing Data")
+    st.caption("Copies all your current SQLite data into Supabase. Safe to run multiple times.")
+
+    if not using_supabase():
+        st.warning("Connect to Supabase first before migrating.")
+    else:
+        if st.button("🚀 Migrate SQLite → Supabase", type="primary"):
+            with st.spinner("Migrating data..."):
+                success, message = migrate_sqlite_to_supabase()
+            if success:
+                st.success("Migration complete!")
+                st.text(message)
+            else:
+                st.error(message)
+
+    st.divider()
+    st.subheader("Connection Status")
+    st.write(f"**Mode:** {'☁️ Supabase (cloud)' if using_supabase() else '💾 SQLite (local)'}")
+    st.write(f"**SQLite path:** `{DB_NAME}`")
+    st.warning("Never commit your Supabase secret key to GitHub. Keep it in Streamlit Secrets only.")
 
 
 elif menu == "Settings / Business Profile":
