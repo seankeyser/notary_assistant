@@ -12,7 +12,7 @@ from streamlit_calendar import calendar
 
 
 DB_NAME = os.environ.get("NOTARY_DB_PATH", "notary_assistant.db")
-APP_VERSION = "3.2.0"
+APP_VERSION = "3.3.0"
 _SAFE_EXPORT_TABLES = frozenset(
     ["clients", "appointments", "payments", "checklist", "attachments", "followups", "settings"]
 )
@@ -325,6 +325,30 @@ def create_tables():
                 appointment_id INTEGER, followup_date TEXT, followup_type TEXT,
                 outcome TEXT, notes TEXT, completed INTEGER DEFAULT 0,
                 FOREIGN KEY (appointment_id) REFERENCES appointments(id))""",
+            """CREATE TABLE IF NOT EXISTS status_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                appointment_id INTEGER,
+                old_status TEXT,
+                new_status TEXT,
+                changed_at TEXT)""",
+            """CREATE TABLE IF NOT EXISTS quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT,
+                signing_type TEXT,
+                fee REAL,
+                created_date TEXT,
+                status TEXT DEFAULT 'Sent',
+                notes TEXT,
+                quote_text TEXT)""",
+            """CREATE TABLE IF NOT EXISTS client_comms (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id INTEGER,
+                client_name TEXT,
+                comm_date TEXT,
+                comm_type TEXT,
+                direction TEXT,
+                subject TEXT,
+                notes TEXT)""",
             """CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 expense_date TEXT,
@@ -1085,7 +1109,56 @@ def update_appointment(appointment_id, client_name, client_phone, client_email,
     get_all_appointments_dataframe.clear()
 
 
+def _record_status_history(appointment_id, old_status, new_status):
+    """Record a status change in history log."""
+    changed_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        if using_supabase():
+            sb().table("status_history").insert({
+                "appointment_id": appointment_id, "old_status": old_status,
+                "new_status": new_status, "changed_at": changed_at
+            }).execute()
+        else:
+            with db_conn() as conn:
+                conn.execute(
+                    "INSERT INTO status_history (appointment_id, old_status, new_status, changed_at) VALUES (?,?,?,?)",
+                    (appointment_id, old_status, new_status, changed_at)
+                )
+                conn.commit()
+    except Exception:
+        pass  # Never crash status updates due to history logging
+
+
+def get_status_history(appointment_id):
+    try:
+        if using_supabase():
+            resp = sb().table("status_history").select("*").eq("appointment_id", appointment_id).order("changed_at").execute()
+            if resp.data:
+                return pd.DataFrame(resp.data)
+        else:
+            with db_conn() as conn:
+                return pd.read_sql_query(
+                    "SELECT * FROM status_history WHERE appointment_id=? ORDER BY changed_at",
+                    conn, params=(appointment_id,)
+                )
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 def update_status(appointment_id, new_status):
+    # Get current status for history
+    try:
+        df_cur = get_all_appointments_dataframe()
+        if not df_cur.empty:
+            cur_rows = df_cur[df_cur["id"] == appointment_id]
+            old_status = cur_rows.iloc[0]["status"] if not cur_rows.empty else "Unknown"
+        else:
+            old_status = "Unknown"
+        _record_status_history(appointment_id, old_status, new_status)
+    except Exception:
+        pass
+
     if using_supabase():
         try:
             sb().table("appointments").update({"status": new_status}).eq("id", appointment_id).execute()
@@ -1409,6 +1482,95 @@ def delete_expense(expense_id):
     with db_conn() as conn:
         conn.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
         conn.commit()
+
+
+QUOTE_STATUSES = ["Sent", "Accepted", "Declined", "Expired", "Converted"]
+COMM_TYPES = ["Email", "Phone Call", "Text / SMS", "In Person", "Other"]
+COMM_DIRECTIONS = ["Outbound", "Inbound"]
+
+
+def save_quote_record(client_name, signing_type, fee, quote_text_val, notes=""):
+    created = str(date.today())
+    if using_supabase():
+        try:
+            sb().table("quotes").insert({
+                "client_name": client_name, "signing_type": signing_type,
+                "fee": float(fee), "created_date": created,
+                "status": "Sent", "notes": notes, "quote_text": quote_text_val
+            }).execute()
+            return
+        except Exception:
+            pass
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO quotes (client_name, signing_type, fee, created_date, status, notes, quote_text) VALUES (?,?,?,?,?,?,?)",
+            (client_name, signing_type, float(fee), created, "Sent", notes, quote_text_val)
+        )
+        conn.commit()
+
+
+def get_quotes_dataframe():
+    if using_supabase():
+        try:
+            resp = sb().table("quotes").select("*").order("created_date", desc=True).execute()
+            if resp.data:
+                return pd.DataFrame(resp.data)
+        except Exception:
+            pass
+    with db_conn() as conn:
+        return pd.read_sql_query("SELECT * FROM quotes ORDER BY created_date DESC", conn)
+
+
+def update_quote_status(quote_id, new_status):
+    if using_supabase():
+        try:
+            sb().table("quotes").update({"status": new_status}).eq("id", quote_id).execute()
+            return
+        except Exception:
+            pass
+    with db_conn() as conn:
+        conn.execute("UPDATE quotes SET status=? WHERE id=?", (new_status, quote_id))
+        conn.commit()
+
+
+def add_client_comm(client_id, client_name, comm_type, direction, subject, notes):
+    comm_date = datetime.now().strftime("%Y-%m-%d %H:%M")
+    if using_supabase():
+        try:
+            sb().table("client_comms").insert({
+                "client_id": client_id, "client_name": client_name,
+                "comm_date": comm_date, "comm_type": comm_type,
+                "direction": direction, "subject": subject, "notes": notes
+            }).execute()
+            return
+        except Exception:
+            pass
+    with db_conn() as conn:
+        conn.execute(
+            "INSERT INTO client_comms (client_id, client_name, comm_date, comm_type, direction, subject, notes) VALUES (?,?,?,?,?,?,?)",
+            (client_id, client_name, comm_date, comm_type, direction, subject, notes)
+        )
+        conn.commit()
+
+
+def get_client_comms(client_id=None):
+    if using_supabase():
+        try:
+            q = sb().table("client_comms").select("*").order("comm_date", desc=True)
+            if client_id:
+                q = q.eq("client_id", client_id)
+            resp = q.execute()
+            if resp.data:
+                return pd.DataFrame(resp.data)
+        except Exception:
+            pass
+    with db_conn() as conn:
+        if client_id:
+            return pd.read_sql_query(
+                "SELECT * FROM client_comms WHERE client_id=? ORDER BY comm_date DESC",
+                conn, params=(client_id,)
+            )
+        return pd.read_sql_query("SELECT * FROM client_comms ORDER BY comm_date DESC", conn)
 
 def save_template(template_name, signing_type, location, fee, mileage, duration_minutes, notes, client_notes, internal_notes):
     with db_conn() as conn:
@@ -2275,10 +2437,10 @@ MENU_OPTIONS = [
 
 MENU_GROUPS = {
     "📊 Overview": ["Dashboard", "Calendar View", "Global Search"],
-    "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History", "Client Portal", "Retention Report"],
+    "👤 Clients": ["Add Client", "View Clients", "Edit Client", "Client History", "Client Portal", "Retention Report", "Communication Log"],
     "📅 Appointments": ["Add Appointment", "View Appointments", "Edit Appointment", "Delete Appointment", "Job Checklist", "Appointment Templates", "Recurring Scheduler"],
-    "💰 Finance": ["Payment Tracking", "Invoice Status", "Invoice Generator", "Quote Generator", "Reports / Export", "Mileage / Tax Report", "Expense Tracker"],
-    "📬 Tools": ["Follow-Up Tracker", "Email Templates", "Map / Route Tools", "Document Attachments", "Referral Analytics", "Signing Day Sheet", "Service Area Map"],
+    "💰 Finance": ["Payment Tracking", "Invoice Status", "Invoice Generator", "Quote Generator", "Quote Tracking", "Reports / Export", "Mileage / Tax Report", "Expense Tracker", "Profit & Loss"],
+    "📬 Tools": ["Follow-Up Tracker", "Email Templates", "Map / Route Tools", "Document Attachments", "Referral Analytics", "Signing Day Sheet", "Service Area Map", "Notary Journal"],
     "⚙️ Admin": ["Admin / System Health", "Cloud Database Setup", "Settings / Business Profile", "Backup / Restore"],
 }
 
@@ -2900,6 +3062,25 @@ if menu == "Dashboard":
                 hour_counts.index = [f"{h:02d}:00" for h in hour_counts.index]
                 st.bar_chart(hour_counts)
 
+        # ── Revenue vs Expenses ────────────────────────────────────────────
+        st.divider()
+        st.subheader("Revenue vs Expenses")
+        exp_df_dash = get_expenses_dataframe()
+        if not exp_df_dash.empty:
+            exp_df_dash["expense_date"] = pd.to_datetime(exp_df_dash["expense_date"], errors="coerce")
+            exp_df_dash["amount"] = pd.to_numeric(exp_df_dash["amount"], errors="coerce").fillna(0)
+            exp_df_dash["month"] = exp_df_dash["expense_date"].dt.strftime("%Y-%m")
+            monthly_expenses = exp_df_dash.groupby("month")["amount"].sum()
+            monthly_revenue = df.groupby("month")["fee"].sum()
+            rev_exp_df = pd.DataFrame({
+                "Revenue": monthly_revenue,
+                "Expenses": monthly_expenses
+            }).fillna(0).sort_index()
+            if not rev_exp_df.empty:
+                st.bar_chart(rev_exp_df)
+        else:
+            st.caption("Add expenses in the Expense Tracker to see revenue vs expenses here.")
+
         # ── Notification digest button ──────────────────────────────────────
         st.divider()
         notify_col1, notify_col2 = st.columns([3, 1])
@@ -3077,6 +3258,71 @@ elif menu == "Add Client":
                     st.session_state.pop("confirm_add_client", None)
                     add_client(client_name, phone, email, address, referral_source, notes)
                     st.success("Client saved successfully!")
+
+
+elif menu == "Communication Log":
+    st.header("Communication Log")
+    st.caption("Track every email, call, and text with each client in one timeline.")
+
+    clients = get_clients()
+    if not clients:
+        st.info("Add clients first.")
+    else:
+        comm_tab1, comm_tab2 = st.tabs(["📝 Log Communication", "📋 View History"])
+
+        with comm_tab1:
+            client_choices = {f"{c[1]} — {c[3] or 'No email'}": c[0] for c in clients}
+            selected_comm_client = st.selectbox("Client", list(client_choices.keys()), key="comm_client")
+            comm_client_id = client_choices[selected_comm_client]
+            comm_client_name = selected_comm_client.split(" — ")[0]
+
+            with st.form("comm_form"):
+                comm_type = st.selectbox("Type", COMM_TYPES)
+                comm_direction = st.selectbox("Direction", COMM_DIRECTIONS)
+                comm_subject = st.text_input("Subject / Topic", placeholder="e.g. Appointment confirmation, Payment follow-up")
+                comm_notes = st.text_area("Notes", height=100)
+
+                if st.form_submit_button("💾 Log Communication", type="primary"):
+                    if not comm_subject.strip():
+                        st.error("Subject is required.")
+                    else:
+                        add_client_comm(comm_client_id, comm_client_name, comm_type,
+                                       comm_direction, comm_subject, comm_notes)
+                        st.success(f"Logged {comm_type} with {comm_client_name}")
+                        st.rerun()
+
+        with comm_tab2:
+            # Filter options
+            filter_col1, filter_col2 = st.columns(2)
+            with filter_col1:
+                view_client = st.selectbox("View Client", ["All Clients"] + [c[1] for c in clients], key="comm_view")
+            with filter_col2:
+                view_type = st.selectbox("Filter Type", ["All"] + COMM_TYPES, key="comm_type_filter")
+
+            if view_client == "All Clients":
+                comms_df = get_client_comms()
+            else:
+                client_id_view = next(c[0] for c in clients if c[1] == view_client)
+                comms_df = get_client_comms(client_id_view)
+
+            if view_type != "All" and not comms_df.empty:
+                comms_df = comms_df[comms_df["comm_type"] == view_type]
+
+            if comms_df.empty:
+                st.info("No communications logged yet.")
+            else:
+                for _, comm_row in comms_df.iterrows():
+                    direction_icon = "📤" if comm_row.get("direction") == "Outbound" else "📥"
+                    type_icon = {"Email":"📧","Phone Call":"📞","Text / SMS":"💬",
+                                "In Person":"🤝","Other":"📌"}.get(comm_row.get("comm_type",""), "📌")
+                    with st.expander(
+                        f"{direction_icon} {type_icon} {comm_row['comm_date']} — "
+                        f"{comm_row['client_name']} — {comm_row['subject']}"
+                    ):
+                        st.write(f"**Type:** {comm_row['comm_type']} ({comm_row['direction']})")
+                        st.write(f"**Date:** {comm_row['comm_date']}")
+                        if comm_row.get("notes"):
+                            st.write(f"**Notes:** {comm_row['notes']}")
 
 
 elif menu == "Retention Report":
@@ -3562,10 +3808,8 @@ elif menu == "View Appointments":
     st.header("View Appointments")
 
     col1, col2 = st.columns(2)
-
     with col1:
         search_text = st.text_input("Search")
-
     with col2:
         status_filter = st.selectbox("Filter by Status", ["All"] + STATUSES)
 
@@ -3574,6 +3818,24 @@ elif menu == "View Appointments":
     if len(appointments) == 0:
         st.warning("No appointments found.")
     else:
+        # ── Bulk Status Update ────────────────────────────────────────────
+        with st.expander("⚡ Bulk Status Update", expanded=False):
+            st.caption("Select appointments and update all at once.")
+            bulk_ids = st.multiselect(
+                "Select Appointments",
+                options=[a[0] for a in appointments],
+                format_func=lambda x: next(
+                    f"{a[1]} — {a[2]} — {a[8]}" for a in appointments if a[0] == x
+                )
+            )
+            bulk_new_status = st.selectbox("New Status for Selected", STATUSES, key="bulk_status")
+            if st.button("✅ Apply to Selected", type="primary", disabled=len(bulk_ids) == 0):
+                for bid in bulk_ids:
+                    update_status(bid, bulk_new_status)
+                clear_all_caches()
+                st.success(f"Updated {len(bulk_ids)} appointment(s) to '{bulk_new_status}'")
+                st.rerun()
+
         # Single bulk query instead of per-row DB hit
         all_paid = get_all_payment_totals()
         for appt in appointments:
@@ -4264,6 +4526,70 @@ elif menu == "Document Attachments":
                     else:
                         st.caption("File not available locally.")
                     st.divider()
+
+
+elif menu == "Quote Tracking":
+    st.header("Quote Tracking")
+    st.caption("Track which quotes were sent, accepted, declined, or converted to appointments.")
+
+    quotes_df = get_quotes_dataframe()
+
+    if quotes_df.empty:
+        st.info("No quotes logged yet. Send a quote from the Quote Generator and click 'Log Quote as Sent'.")
+    else:
+        quotes_df["fee"] = pd.to_numeric(quotes_df["fee"], errors="coerce").fillna(0)
+
+        # Summary
+        status_counts = quotes_df["status"].value_counts()
+        total_quoted = quotes_df["fee"].sum()
+        accepted_val = quotes_df[quotes_df["status"] == "Accepted"]["fee"].sum()
+        conversion = len(quotes_df[quotes_df["status"].isin(["Accepted","Converted"])]) / len(quotes_df) * 100
+
+        is_dark_qt = dark_mode
+        cb = "#1e293b" if is_dark_qt else "#f8fafc"
+        cborder = "#334155" if is_dark_qt else "#e2e8f0"
+        clabel = "#94a3b8" if is_dark_qt else "#64748b"
+
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0.5rem;margin-bottom:1rem;">
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Total Quoted</div>
+                <div style="font-size:1.2rem;font-weight:700;color:#3b82f6;">${total_quoted:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Accepted Value</div>
+                <div style="font-size:1.2rem;font-weight:700;color:#22c55e;">${accepted_val:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Conversion Rate</div>
+                <div style="font-size:1.2rem;font-weight:700;color:#f59e0b;">{conversion:.0f}%</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Total Quotes</div>
+                <div style="font-size:1.2rem;font-weight:700;">{len(quotes_df)}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        status_filter_qt = st.selectbox("Filter by Status", ["All"] + QUOTE_STATUSES)
+        filtered_qt = quotes_df if status_filter_qt == "All" else quotes_df[quotes_df["status"] == status_filter_qt]
+
+        for _, qrow in filtered_qt.iterrows():
+            status_color = {"Sent":"#3b82f6","Accepted":"#22c55e","Declined":"#ef4444",
+                           "Expired":"#94a3b8","Converted":"#8b5cf6"}.get(qrow["status"],"#64748b")
+            with st.expander(
+                f"{qrow['created_date']} — {qrow['client_name']} — "
+                f"{qrow['signing_type']} — ${float(qrow['fee']):,.2f} — {qrow['status']}"
+            ):
+                new_status = st.selectbox("Update Status", QUOTE_STATUSES,
+                    index=QUOTE_STATUSES.index(qrow["status"]) if qrow["status"] in QUOTE_STATUSES else 0,
+                    key=f"qt_status_{qrow['id']}")
+                if st.button("Save Status", key=f"qt_save_{qrow['id']}"):
+                    update_quote_status(int(qrow["id"]), new_status)
+                    st.success("Status updated!")
+                    st.rerun()
+                if qrow.get("notes"):
+                    st.caption(f"Notes: {qrow['notes']}")
 
 
 elif menu == "Reports / Export":
@@ -5022,6 +5348,110 @@ elif menu == "Settings / Business Profile":
             st.rerun()
 
 
+elif menu == "Profit & Loss":
+    st.header("Profit & Loss")
+    st.caption("Income vs expenses by month and year.")
+
+    df_pl = get_all_appointments_dataframe()
+    exp_pl = get_expenses_dataframe()
+
+    if df_pl.empty:
+        st.info("No appointment data yet.")
+    else:
+        df_pl["fee"] = pd.to_numeric(df_pl["fee"], errors="coerce").fillna(0)
+        df_pl["appointment_date"] = pd.to_datetime(df_pl["appointment_date"], errors="coerce")
+        df_pl["month"] = df_pl["appointment_date"].dt.strftime("%Y-%m")
+        df_pl["year"] = df_pl["appointment_date"].dt.year
+
+        if not exp_pl.empty:
+            exp_pl["amount"] = pd.to_numeric(exp_pl["amount"], errors="coerce").fillna(0)
+            exp_pl["expense_date"] = pd.to_datetime(exp_pl["expense_date"], errors="coerce")
+            exp_pl["month"] = exp_pl["expense_date"].dt.strftime("%Y-%m")
+            exp_pl["year"] = exp_pl["expense_date"].dt.year
+
+        years_pl = sorted(df_pl["year"].dropna().unique().astype(int), reverse=True)
+        pl_year = st.selectbox("Year", years_pl, key="pl_year")
+
+        df_yr = df_pl[df_pl["year"] == pl_year]
+        all_paid_pl = get_all_payment_totals()
+        df_yr = df_yr.copy()
+        df_yr["collected"] = df_yr["id"].apply(lambda x: all_paid_pl.get(int(x), 0.0))
+
+        monthly_revenue_pl = df_yr.groupby("month")["fee"].sum()
+        monthly_collected_pl = df_yr.groupby("month")["collected"].sum()
+
+        if not exp_pl.empty:
+            exp_yr = exp_pl[exp_pl["year"] == pl_year]
+            monthly_exp_pl = exp_yr.groupby("month")["amount"].sum()
+        else:
+            monthly_exp_pl = pd.Series(dtype=float)
+
+        all_months = sorted(set(monthly_revenue_pl.index) | set(monthly_exp_pl.index))
+        pl_data = []
+        for m in all_months:
+            rev = float(monthly_revenue_pl.get(m, 0))
+            col = float(monthly_collected_pl.get(m, 0))
+            exp = float(monthly_exp_pl.get(m, 0))
+            net = col - exp
+            pl_data.append({
+                "Month": m,
+                "Billed": rev,
+                "Collected": col,
+                "Expenses": exp,
+                "Net": net
+            })
+
+        pl_df = pd.DataFrame(pl_data)
+
+        total_billed = pl_df["Billed"].sum()
+        total_collected = pl_df["Collected"].sum()
+        total_expenses = pl_df["Expenses"].sum()
+        total_net = total_collected - total_expenses
+
+        is_dark_pl = dark_mode
+        cb = "#1e293b" if is_dark_pl else "#f8fafc"
+        cborder = "#334155" if is_dark_pl else "#e2e8f0"
+        clabel = "#94a3b8" if is_dark_pl else "#64748b"
+
+        st.markdown(f"""
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:0.5rem;margin-bottom:1rem;">
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Total Billed</div>
+                <div style="font-size:1.3rem;font-weight:700;color:#3b82f6;">${total_billed:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Collected</div>
+                <div style="font-size:1.3rem;font-weight:700;color:#22c55e;">${total_collected:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Expenses</div>
+                <div style="font-size:1.3rem;font-weight:700;color:#ef4444;">${total_expenses:,.2f}</div>
+            </div>
+            <div style="background:{cb};border:1px solid {cborder};border-radius:10px;padding:0.6rem 0.75rem;">
+                <div style="font-size:0.72rem;color:{clabel};">Net Profit</div>
+                <div style="font-size:1.3rem;font-weight:700;color:{'#22c55e' if total_net >= 0 else '#ef4444'};">${total_net:,.2f}</div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if not pl_df.empty:
+            chart_df = pl_df.set_index("Month")[["Collected","Expenses","Net"]]
+            st.bar_chart(chart_df)
+
+            st.subheader("Monthly Detail")
+            display_pl = pl_df.copy()
+            for col in ["Billed","Collected","Expenses","Net"]:
+                display_pl[col] = display_pl[col].map("${:,.2f}".format)
+            st.dataframe(display_pl, use_container_width=True, hide_index=True)
+
+            st.download_button(
+                "⬇️ Download P&L CSV",
+                data=pl_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"profit_loss_{pl_year}.csv",
+                mime="text/csv"
+            )
+
+
 elif menu == "Expense Tracker":
     st.header("Expense Tracker")
     st.caption("Track business expenses for Schedule C deductions.")
@@ -5173,6 +5603,67 @@ elif menu == "Signing Day Sheet":
                     if gcal_url:
                         st.markdown(f"[📅 Add to Google Calendar]({gcal_url})")
 
+                    # Status timeline
+                    history_df = get_status_history(appointment_id)
+                    if not history_df.empty:
+                        st.caption("**Status Timeline:**")
+                        for _, h in history_df.iterrows():
+                            st.caption(f"  {h['changed_at']} — {h['old_status']} → {h['new_status']}")
+
+                    # Print-friendly detail download
+                    if st.button("🖨️ Download Detail Sheet", key=f"print_{appointment_id}"):
+                        checklist_items = get_checklist(appointment_id)
+                        payment_hist = get_payments_dataframe()
+                        appt_payments = payment_hist[
+                            payment_hist["appointment_id"] == appointment_id
+                        ] if not payment_hist.empty else pd.DataFrame()
+
+                        detail_lines = [
+                            f"APPOINTMENT DETAIL SHEET",
+                            f"{settings.get('business_name','')}",
+                            f"Generated: {date.today()}",
+                            "=" * 55,
+                            f"Client:       {client_name}",
+                            f"Date:         {appointment_date}",
+                            f"Time:         {appointment_time} — {appt_row.get('end_time','')}",
+                            f"Type:         {signing_type}",
+                            f"Location:     {location}",
+                            f"Status:       {status}",
+                            f"Fee:          ${float(fee):,.2f}",
+                            f"Paid:         ${paid:,.2f}",
+                            f"Balance:      ${balance:,.2f}",
+                            f"Mileage:      {mileage} miles",
+                        ]
+                        if client_notes_val:
+                            detail_lines.append(f"Client Notes: {client_notes_val}")
+                        if internal_notes_val:
+                            detail_lines.append(f"Int. Notes:   {internal_notes_val}")
+
+                        detail_lines += ["", "CHECKLIST", "-" * 30]
+                        for _, item_name, completed in checklist_items:
+                            detail_lines.append(f"[{'✓' if completed else ' '}] {item_name}")
+
+                        if not appt_payments.empty:
+                            detail_lines += ["", "PAYMENTS", "-" * 30]
+                            for _, prow in appt_payments.iterrows():
+                                detail_lines.append(
+                                    f"{prow['payment_date']}  ${float(prow['amount_paid']):,.2f}  "
+                                    f"{prow['payment_method']}"
+                                )
+
+                        if not history_df.empty:
+                            detail_lines += ["", "STATUS HISTORY", "-" * 30]
+                            for _, h in history_df.iterrows():
+                                detail_lines.append(f"{h['changed_at']}  {h['old_status']} → {h['new_status']}")
+
+                        st.download_button(
+                            "⬇️ Download",
+                            data="\n".join(detail_lines),
+                            file_name=f"appointment_{appointment_id}_{client_name.replace(' ','_')}.txt",
+                            mime="text/plain",
+                            key=f"dl_detail_{appointment_id}"
+                        )
+
                     st.divider()
 
             # Downloadable plain-text version
@@ -5275,6 +5766,140 @@ elif menu == "Service Area Map":
             file_name="service_area_locations.csv",
             mime="text/csv"
         )
+
+
+elif menu == "Notary Journal":
+    st.header("Notary Journal Export")
+    st.caption("Generate a formatted journal log for Florida notary record-keeping requirements.")
+
+    df_nj = get_all_appointments_dataframe()
+    if df_nj.empty:
+        st.info("No appointments to export.")
+    else:
+        df_nj["appointment_date"] = pd.to_datetime(df_nj["appointment_date"], errors="coerce")
+        df_nj["fee"] = pd.to_numeric(df_nj["fee"], errors="coerce").fillna(0)
+
+        nj_col1, nj_col2 = st.columns(2)
+        with nj_col1:
+            nj_start = st.date_input("From Date", value=date(date.today().year, 1, 1), key="nj_start")
+        with nj_col2:
+            nj_end = st.date_input("To Date", value=date.today(), key="nj_end")
+
+        nj_df = df_nj[
+            (df_nj["appointment_date"].dt.date >= nj_start) &
+            (df_nj["appointment_date"].dt.date <= nj_end)
+        ].sort_values("appointment_date")
+
+        st.write(f"**{len(nj_df)} entries** from {nj_start} to {nj_end}")
+
+        if not nj_df.empty:
+            # Preview table
+            st.subheader("Journal Preview")
+            preview_cols = ["appointment_date","appointment_time","client_name",
+                           "signing_type","location","fee","status"]
+            preview_df = nj_df[[c for c in preview_cols if c in nj_df.columns]].copy()
+            preview_df["appointment_date"] = preview_df["appointment_date"].dt.strftime("%m/%d/%Y")
+            st.dataframe(preview_df, use_container_width=True, hide_index=True)
+
+            # Generate formatted text journal
+            journal_lines = [
+                "NOTARY PUBLIC JOURNAL OF OFFICIAL ACTS",
+                f"Notary: {settings.get('business_name', '')}",
+                f"State of Florida",
+                f"Period: {nj_start.strftime('%B %d, %Y')} — {nj_end.strftime('%B %d, %Y')}",
+                f"Generated: {date.today().strftime('%B %d, %Y')}",
+                "=" * 70,
+                "",
+            ]
+
+            for entry_num, (_, row) in enumerate(nj_df.iterrows(), 1):
+                appt_date = row["appointment_date"].strftime("%m/%d/%Y") if pd.notna(row["appointment_date"]) else "—"
+                journal_lines += [
+                    f"ENTRY #{entry_num:04d}",
+                    f"Date of Act:        {appt_date}",
+                    f"Time:               {row.get('appointment_time', '—')}",
+                    f"Type of Act:        {row.get('signing_type', '—')}",
+                    f"Name of Signer:     {row.get('client_name', '—')}",
+                    f"Address of Signer:  {row.get('location', '—')}",
+                    f"ID Presented:       ___________________________",
+                    f"ID Number:          ___________________________",
+                    f"Fee Charged:        ${float(row.get('fee') or 0):,.2f}",
+                    f"Thumbprint:         [ ]",
+                    f"Notes:              {row.get('notes', '') or ''}",
+                    "-" * 70,
+                    "",
+                ]
+
+            journal_lines += [
+                "",
+                f"Total Entries: {len(nj_df)}",
+                f"Total Fees:    ${nj_df['fee'].sum():,.2f}",
+                "",
+                "Notary Signature: _________________________  Date: ___________",
+                "Commission #: _____________________________  Expires: _________",
+            ]
+
+            journal_text = "\n".join(journal_lines)
+
+            dj_col1, dj_col2 = st.columns(2)
+            with dj_col1:
+                st.download_button(
+                    "⬇️ Download Journal (.txt)",
+                    data=journal_text,
+                    file_name=f"notary_journal_{nj_start}_{nj_end}.txt",
+                    mime="text/plain"
+                )
+            with dj_col2:
+                # PDF version
+                if st.button("📄 Generate PDF Journal"):
+                    try:
+                        from reportlab.lib.pagesizes import letter
+                        from reportlab.pdfgen import canvas as rl_canvas
+                        import io as _io
+                        buf = _io.BytesIO()
+                        c = rl_canvas.Canvas(buf, pagesize=letter)
+                        w, h = letter
+                        y = h - 50
+                        c.setFont("Helvetica-Bold", 14)
+                        c.drawString(50, y, "NOTARY PUBLIC JOURNAL OF OFFICIAL ACTS")
+                        y -= 20
+                        c.setFont("Helvetica", 10)
+                        for line in [
+                            f"Notary: {settings.get('business_name','')}",
+                            f"State of Florida",
+                            f"Period: {nj_start} — {nj_end}",
+                        ]:
+                            c.drawString(50, y, line); y -= 14
+                        y -= 10
+                        for entry_num, (_, row) in enumerate(nj_df.iterrows(), 1):
+                            if y < 200:
+                                c.showPage()
+                                y = h - 50
+                                c.setFont("Helvetica", 10)
+                            appt_date = row["appointment_date"].strftime("%m/%d/%Y") if pd.notna(row["appointment_date"]) else "—"
+                            c.setFont("Helvetica-Bold", 10)
+                            c.drawString(50, y, f"Entry #{entry_num:04d} — {appt_date} — {row.get('signing_type','')}")
+                            y -= 14
+                            c.setFont("Helvetica", 9)
+                            for label, val in [
+                                ("Signer", row.get("client_name","")),
+                                ("Location", row.get("location","")),
+                                ("Fee", f"${float(row.get('fee') or 0):,.2f}"),
+                                ("ID Presented", "_______________________"),
+                                ("Thumbprint", "[ ]"),
+                            ]:
+                                c.drawString(60, y, f"{label}: {val}"); y -= 12
+                            y -= 6
+                        c.save()
+                        buf.seek(0)
+                        st.download_button(
+                            "⬇️ Download PDF",
+                            data=buf.getvalue(),
+                            file_name=f"notary_journal_{nj_start}_{nj_end}.pdf",
+                            mime="application/pdf"
+                        )
+                    except Exception as e:
+                        st.error(f"PDF generation failed: {e}")
 
 
 elif menu == "Appointment Templates":
