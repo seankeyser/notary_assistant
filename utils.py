@@ -13,7 +13,36 @@ from streamlit_calendar import calendar
 
 
 DB_NAME = os.environ.get("NOTARY_DB_PATH", "notary_assistant.db")
-APP_VERSION = "3.3.0"
+APP_VERSION = "3.4.0"
+PORTAL_TOKEN_DAYS = 7  # Portal links expire after this many days
+
+
+def _make_portal_token(client_id, day_bucket=None):
+    """Generate a token valid for the current 7-day window."""
+    import base64, hashlib, math
+    try:
+        secret = st.secrets.get("SUPABASE_KEY", "notary")[:16]
+    except Exception:
+        secret = "notary_default_key"
+    if day_bucket is None:
+        day_bucket = math.floor(datetime.now().timestamp() / 86400 / PORTAL_TOKEN_DAYS)
+    payload = f"{client_id}:{secret}:{day_bucket}"
+    return base64.urlsafe_b64encode(
+        hashlib.sha256(payload.encode()).digest()[:12]
+    ).decode().rstrip("=")
+
+
+def _verify_portal_token(client_id, token):
+    """Accept tokens from current or previous window (grace period)."""
+    import math
+    try:
+        day_bucket = math.floor(datetime.now().timestamp() / 86400 / PORTAL_TOKEN_DAYS)
+        for bucket in [day_bucket, day_bucket - 1]:
+            if token == _make_portal_token(client_id, bucket):
+                return True
+        return False
+    except Exception:
+        return False
 _SAFE_EXPORT_TABLES = frozenset(
     ["clients", "appointments", "payments", "checklist", "attachments", "followups", "settings"]
 )
