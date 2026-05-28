@@ -1,3 +1,7 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import streamlit as st
 import pandas as pd
 from utils import *
@@ -413,3 +417,4 @@ def render(menu, settings, dark_mode):
                 st.success(f"Database restored. Previous database backed up to: {backup_path}")
                 st.rerun()
     
+
