@@ -1,0 +1,113 @@
+.stApp {
+    background: #0B1F3A;
+    color: white;
+}
+
+section[data-testid="stSidebar"] {
+    background-color: #07172B;
+}
+
+html, body, [class*="css"] {
+    color: white;
+}
+
+label, .stMarkdown, .stText {
+    color: white !important;
+}
+
+input, textarea {
+    background-color: #1F2937 !important;
+    color: white !important;
+}
+
+div[data-baseweb="select"] > div {
+    background-color: #1F2937 !important;
+    color: white !important;
+}
+
+.stButton > button,
+.stDownloadButton > button {
+    background-color: #8B1E2D;
+    color: white;
+    border-radius: 10px;
+    border: none;
+    padding: 0.6rem 1rem;
+    font-weight: 600;
+}
+
+.stButton > button:hover,
+.stDownloadButton > button:hover {
+    background-color: #A72838;
+    color: white;
+}
+
+.brand-header {
+    background: #F7F5F1;
+    color: #0B1F3A;
+    padding: 24px;
+    border-radius: 20px;
+    margin-bottom: 24px;
+    box-shadow: 0 4px 18px rgba(0,0,0,0.35);
+    text-align: center;
+}
+
+.brand-header h1 {
+    color: #0B1F3A;
+    font-size: 44px;
+    margin-bottom: 0;
+    letter-spacing: 1px;
+}
+
+.brand-header h2 {
+    color: #0B1F3A;
+    font-size: 26px;
+    margin-top: 0;
+}
+
+.brand-header p {
+    color: #8B1E2D;
+    font-size: 20px;
+    font-style: italic;
+    font-weight: 600;
+}
+
+.metric-card {
+    background: #F7F5F1;
+    color: #0B1F3A;
+    padding: 22px;
+    border-radius: 18px;
+    text-align: center;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.25);
+    min-height: 125px;
+}
+
+.metric-card h4 {
+    color: #0B1F3A;
+    margin-bottom: 8px;
+    font-size: 14px;
+}
+
+.metric-card h2 {
+    color: #0B1F3A;
+    margin: 0;
+    font-size: 30px;
+}
+
+.metric-card p {
+    color: #8B1E2D;
+    margin-top: 6px;
+    font-size: 13px;
+}
+
+.section-card {
+    background: #F7F5F1;
+    color: #0B1F3A;
+    padding: 22px;
+    border-radius: 18px;
+    box-shadow: 0 3px 14px rgba(0,0,0,0.25);
+    margin-top: 18px;
+}
+
+.section-card h3 {
+    color: #0B1F3A;
+}
